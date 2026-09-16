@@ -32,14 +32,15 @@ def health(): return {"ok":True,"relay":True}
 @app.post("/analyze")
 def analyze(req:AnalyzeRequest):
     purge(); opts={
-        "quiet":True,
-        "no_warnings":True,
+        "quiet":False,
+        "verbose":True,
+        "no_warnings":False,
         "skip_download":True,
         "noplaylist":True,
         "js_runtimes":{"deno":{}},
         "remote_components":{"ejs:npm"},
         "extractor_args":{
-            "youtube":{"player_client":["mweb"]},
+            "youtube":{"player_client":["mweb","web_embedded"]},
             "youtubepot-bgutilscript":{"server_home":["/opt/bgutil-ytdlp-pot-provider/server"]}
         }
     }

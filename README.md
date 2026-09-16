@@ -1,13 +1,12 @@
-# Anything Downloader Render Backend V2
+# Anything Downloader Render Backend V2.1
 
-For media you own, created, or are authorized to download.
+Diagnostic/fallback build for authorized, non-DRM media.
 
-Changes from V1:
-- Installs current yt-dlp plus bgutil-ytdlp-pot-provider.
-- Installs BgUtils provider 2.0.0 in script mode using Deno.
-- Requests the yt-dlp YouTube mweb client and automatic PO-token provider.
-- Preserves /health, /analyze, /media, and /ffmpeg/ffmpeg-core.wasm.
+Changes:
+- Keeps the bgutil PO-token provider and Deno.
+- Uses mweb first and web_embedded as an additional YouTube client.
+- Enables yt-dlp verbose diagnostics so Render logs show provider/client details.
+- Uses the provider's current source checkout rather than an assumed branch tag.
+- Preserves /health, /analyze, /media and /ffmpeg/ffmpeg-core.wasm.
 
-Replace the four backend files in the GitHub repo with this package and let Render rebuild.
-
-Note: PO tokens do not guarantee that YouTube will accept a cloud/datacenter IP.
+After deploying, run Analyze once and inspect the Render application logs.

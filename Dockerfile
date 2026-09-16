@@ -15,7 +15,7 @@ RUN python -m yt_dlp --version
 RUN deno --version
 
 # BgUtils PO-token provider, script mode. It remains internal to this Render container.
-RUN git clone --depth 1 --branch 2.0.0 \
+RUN git clone --depth 1 \
     https://github.com/Brainicism/bgutil-ytdlp-pot-provider.git \
     /opt/bgutil-ytdlp-pot-provider \
     && cd /opt/bgutil-ytdlp-pot-provider/server \
