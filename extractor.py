@@ -1,4 +1,4 @@
-import os, secrets, time
+import os, secrets, time, asyncio
 from typing import Dict
 import httpx, yt_dlp
 from fastapi import FastAPI, HTTPException, Request
@@ -30,7 +30,7 @@ def ffmpeg_wasm():
 @app.get("/health")
 def health(): return {"ok":True,"relay":True}
 @app.post("/analyze")
-def analyze(req:AnalyzeRequest):
+async def analyze(req:AnalyzeRequest):
     purge(); opts={
         "quiet":False,
         "verbose":True,
@@ -44,8 +44,19 @@ def analyze(req:AnalyzeRequest):
             "youtubepot-bgutilscript":{"server_home":["/opt/bgutil-ytdlp-pot-provider/server"]}
         }
     }
+    def run_extract():
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            return ydl.extract_info(req.url, download=False)
+
     try:
-        with yt_dlp.YoutubeDL(opts) as ydl: info=ydl.extract_info(req.url,download=False)
+        # yt-dlp is synchronous. Run it off the FastAPI event loop and prevent
+        # an upstream YouTube/provider stall from leaving the UI waiting forever.
+        info = await asyncio.wait_for(asyncio.to_thread(run_extract), timeout=45)
+    except asyncio.TimeoutError:
+        raise HTTPException(
+            504,
+            "Media analysis timed out after 45 seconds while contacting YouTube. Please try again later."
+        )
     except Exception as e:
         message = str(e)
         lower = message.lower()
