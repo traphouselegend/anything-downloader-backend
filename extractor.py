@@ -31,7 +31,18 @@ def ffmpeg_wasm():
 def health(): return {"ok":True,"relay":True}
 @app.post("/analyze")
 def analyze(req:AnalyzeRequest):
-    purge(); opts={"quiet":True,"no_warnings":True,"skip_download":True,"noplaylist":True,"js_runtimes":{"deno":{}},"remote_components":{"ejs:npm"}}
+    purge(); opts={
+        "quiet":True,
+        "no_warnings":True,
+        "skip_download":True,
+        "noplaylist":True,
+        "js_runtimes":{"deno":{}},
+        "remote_components":{"ejs:npm"},
+        "extractor_args":{
+            "youtube":{"player_client":["mweb"]},
+            "youtubepot-bgutilscript":{"server_home":["/opt/bgutil-ytdlp-pot-provider/server"]}
+        }
+    }
     try:
         with yt_dlp.YoutubeDL(opts) as ydl: info=ydl.extract_info(req.url,download=False)
     except Exception as e: raise HTTPException(400,f"Could not analyze this URL: {e}")
