@@ -1,12 +1,5 @@
-# Anything Downloader Render Backend V2.1
+# Anything Downloader Render Backend V2.2
 
-Diagnostic/fallback build for authorized, non-DRM media.
-
-Changes:
-- Keeps the bgutil PO-token provider and Deno.
-- Uses mweb first and web_embedded as an additional YouTube client.
-- Enables yt-dlp verbose diagnostics so Render logs show provider/client details.
-- Uses the provider's current source checkout rather than an assumed branch tag.
-- Preserves /health, /analyze, /media and /ffmpeg/ffmpeg-core.wasm.
-
-After deploying, run Analyze once and inspect the Render application logs.
+Preserves V2.1 yt-dlp/PO-token diagnostics and returns a clear HTTP 503 message when
+YouTube rate-limits or challenges the Render server. It does not attempt to bypass
+an upstream IP block.

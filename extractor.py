@@ -46,7 +46,14 @@ def analyze(req:AnalyzeRequest):
     }
     try:
         with yt_dlp.YoutubeDL(opts) as ydl: info=ydl.extract_info(req.url,download=False)
-    except Exception as e: raise HTTPException(400,f"Could not analyze this URL: {e}")
+    except Exception as e:
+        message = str(e)
+        lower = message.lower()
+        if "429" in lower or "too many requests" in lower:
+            raise HTTPException(503, "YouTube temporarily rejected the cloud analysis server (HTTP 429). Please try again later.")
+        if "not a bot" in lower or "sign in to confirm" in lower:
+            raise HTTPException(503, "YouTube temporarily challenged the cloud analysis server. Please try again later.")
+        raise HTTPException(400, f"Could not analyze this URL: {message}")
     formats=[]; private={}
     for f in info.get("formats",[]):
         p=pub(f)
