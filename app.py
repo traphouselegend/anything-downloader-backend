@@ -18,7 +18,7 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 
-APP_VERSION = "6.4.10"
+APP_VERSION = "6.4.11"
 SESSION_TTL = int(os.getenv("SESSION_TTL_SECONDS", "1800"))
 JOB_TTL = int(os.getenv("JOB_TTL_SECONDS", "1800"))
 API_KEY = os.getenv("ADAPTER_API_KEY", "").strip()
@@ -443,6 +443,60 @@ def youtube_like(url: str) -> bool:
     return host == "youtu.be" or host == "youtube.com" or host.endswith(".youtube.com")
 
 
+def is_tiktok_info(info: dict[str, Any]) -> bool:
+    extractor = str(info.get("extractor_key") or info.get("extractor") or "").lower()
+    return extractor == "tiktok" or extractor.startswith("tiktok:")
+
+
+async def ytdlp_download_format(source_url: str, format_id: str, directory: str, stem: str) -> Path:
+    """Let yt-dlp perform the media transfer for sites whose signed CDN URLs
+    cannot be replayed reliably by a generic HTTP client.
+
+    The extractor is re-run by yt-dlp and its own downloader receives the exact
+    request context it expects. No cookies/account data are supplied by us.
+    """
+    Path(directory).mkdir(parents=True, exist_ok=True)
+    template = str(Path(directory) / f"{stem}.%(ext)s")
+    cmd = [
+        YTDLP,
+        "--no-playlist",
+        "--no-warnings",
+        "--socket-timeout", "20",
+        "--retries", "3",
+        "--fragment-retries", "3",
+        "--force-ipv4",
+        "--js-runtimes", "node",
+        "--no-part",
+        "--no-continue",
+        "-f", str(format_id),
+        "-o", template,
+        source_url,
+    ]
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        env={**os.environ, "PYTHONUNBUFFERED": "1"},
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=MAX_PREPARE_SECONDS)
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.communicate()
+        raise RuntimeError("yt-dlp media transfer timed out")
+    if proc.returncode != 0:
+        detail = stderr.decode("utf-8", "replace").strip()[-3000:] or stdout.decode("utf-8", "replace").strip()[-1500:] or "yt-dlp media transfer failed"
+        raise RuntimeError(detail)
+
+    candidates = [
+        x for x in Path(directory).glob(f"{stem}.*")
+        if x.is_file() and not x.name.endswith((".part", ".ytdl"))
+    ]
+    if not candidates:
+        raise RuntimeError("yt-dlp finished but did not produce a media file")
+    return max(candidates, key=lambda x: x.stat().st_mtime)
+
+
 async def run_ytdlp(url: str) -> dict[str, Any]:
     base_cmd = [
         YTDLP,
@@ -572,6 +626,98 @@ def build_resolved_ffmpeg_command(
     return cmd
 
 
+async def run_native_transfer_prepare(job_id: str, session_id: str, choice_id: str, start: float | None, end: float | None) -> None:
+    """Prepare a choice by letting yt-dlp itself fetch the selected formats.
+
+    This is intentionally used only for extractors such as TikTok where the
+    resolved CDN URL may return 403 when replayed by an unrelated HTTP client.
+    FFmpeg only touches local files after yt-dlp has completed the transfer.
+    """
+    rec = JOBS[job_id]
+    session = SESSIONS.get(session_id)
+    if not session:
+        rec.update(status="error", error="Media session expired before preparation started")
+        return
+    choice = session.get("choices", {}).get(choice_id)
+    if not choice:
+        rec.update(status="error", error="Unknown quality choice")
+        return
+
+    directory = f"/tmp/anything-downloader-{job_id}"
+    os.makedirs(directory, exist_ok=True)
+    rec["directory"] = directory
+    rec["status"] = "preparing"
+    rec["strategy"] = "yt-dlp-native-transfer"
+
+    try:
+        video_path = await ytdlp_download_format(
+            session["source_url"], str(choice.get("videoFormatId") or ""), directory, "video"
+        )
+        audio_path = None
+        if choice.get("audioFormatId"):
+            audio_path = await ytdlp_download_format(
+                session["source_url"], str(choice["audioFormatId"]), directory, "audio"
+            )
+    except Exception as e:
+        rec.update(status="error", error=f"yt-dlp media transfer failed: {e}")
+        return
+
+    container = str(choice.get("container") or "mp4").lower()
+    if container not in {"mp4", "webm", "mkv", "mov", "m4v"}:
+        container = "mp4"
+    output_path = os.path.join(directory, f"media.{container}")
+    cmd = [FFMPEG, "-hide_banner", "-loglevel", "error", "-nostdin", "-y"]
+    clip_len = None
+    if start is not None and end is not None:
+        clip_len = max(0.0, end - start)
+        cmd += ["-ss", f"{start:.3f}"]
+    cmd += ["-i", str(video_path)]
+    if audio_path:
+        if start is not None:
+            cmd += ["-ss", f"{start:.3f}"]
+        cmd += ["-i", str(audio_path)]
+    if clip_len is not None:
+        cmd += ["-t", f"{clip_len:.3f}"]
+    if audio_path:
+        cmd += ["-map", "0:v:0", "-map", "1:a:0", "-shortest"]
+    else:
+        cmd += ["-map", "0:v:0?", "-map", "0:a:0?"]
+    cmd += ["-c", "copy"]
+    if container == "mp4":
+        cmd += ["-movflags", "+faststart"]
+    cmd += [output_path]
+
+    proc = await asyncio.create_subprocess_exec(
+        *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        env={**os.environ, "PYTHONUNBUFFERED": "1"},
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=MAX_PREPARE_SECONDS)
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.communicate()
+        rec.update(status="error", error="Local mux/clip step timed out")
+        return
+    if proc.returncode != 0:
+        detail = stderr.decode("utf-8", "replace").strip()[-2500:] or stdout.decode("utf-8", "replace").strip()[-1000:] or "FFmpeg local mux failed"
+        rec.update(status="error", error=f"Local mux/clip failed: {detail}")
+        return
+
+    path = Path(output_path)
+    if not path.is_file() or path.stat().st_size <= 0:
+        rec.update(status="error", error="Preparation finished but no output file was produced")
+        return
+    base = safe_name(session.get("title") or "media")
+    if start is not None and end is not None:
+        base += f"_{int(start)}-{int(end)}"
+    filename = f"{base}.{container}"
+    rec.update(
+        status="ready", path=str(path), filename=filename, size=path.stat().st_size,
+        content_type=mimetypes.guess_type(filename)[0] or "application/octet-stream",
+        expires=time.time() + JOB_TTL,
+    )
+
+
 async def run_prepare(job_id: str, session_id: str, choice_id: str, start: float | None, end: float | None) -> None:
     rec = JOBS[job_id]
     session = SESSIONS.get(session_id)
@@ -581,6 +727,10 @@ async def run_prepare(job_id: str, session_id: str, choice_id: str, start: float
     choice = session.get("choices", {}).get(choice_id)
     if not choice:
         rec.update(status="error", error="Unknown quality choice")
+        return
+
+    if session.get("native_transfer"):
+        await run_native_transfer_prepare(job_id, session_id, choice_id, start, end)
         return
 
     streams = session.get("streams", {})
@@ -694,6 +844,14 @@ async def analyze(req: AnalyzeRequest, authorization: str | None = Header(defaul
     if not choices:
         raise HTTPException(422, "The source was identified, but no non-DRM video formats were available")
 
+    native_transfer = "yt-dlp" if is_tiktok_info(info) else None
+    if native_transfer:
+        # TikTok's signed CDN URLs may reject a generic replay even though
+        # extraction succeeded. Keep all selected qualities on the backend so
+        # yt-dlp itself performs the media transfer.
+        for choice in choices:
+            choice["delivery"] = "server"
+
     sid = secrets.token_urlsafe(24)
     streams: dict[str, dict[str, Any]] = {}
     for f in raw_formats:
@@ -752,6 +910,17 @@ async def analyze(req: AnalyzeRequest, authorization: str | None = Header(defaul
 
     choice_map = {c["id"]: c for c in choices}
 
+    # TikTok direct CDN URLs are intentionally not replayed by the browser relay.
+    # Prefer the smallest combined AVC/AAC choice as the native yt-dlp preview.
+    native_preview_choice = None
+    if native_transfer:
+        combined_choices = [c for c in choices if c.get("combined") and not c.get("audioFormatId")]
+        if combined_choices:
+            native_preview_choice = min(
+                combined_choices,
+                key=lambda c: (int(c.get("height") or 10**9), int(c.get("filesize") or 10**18)),
+            )
+
     # If the best preview-quality video has a separate audio stream, the browser
     # cannot play those two URLs as one <video>. Reuse the existing resolved
     # choice and let /preview temporarily mux video+audio into a fast-start MP4.
@@ -762,6 +931,9 @@ async def analyze(req: AnalyzeRequest, authorization: str | None = Header(defaul
             h = int(c.get("height") or 0)
             return (abs(h - 480), h)
         preview_choice = min(audio_preview_choices, key=preview_choice_score)
+    if native_preview_choice:
+        preview_choice = native_preview_choice
+
     SESSIONS[sid] = {
         "expires": time.time() + SESSION_TTL,
         "formats": {k: v for k, v in streams.items() if str(v.get("protocol") or "").lower() in {"https", "http", "https_native", "http_native"}},
@@ -770,6 +942,8 @@ async def analyze(req: AnalyzeRequest, authorization: str | None = Header(defaul
         "source_url": source_url,
         "title": info.get("title") or "media",
         "duration": info.get("duration"),
+        "extractor": info.get("extractor_key") or info.get("extractor"),
+        "native_transfer": native_transfer,
         "preview_dir": None,
     }
 
@@ -786,7 +960,10 @@ async def analyze(req: AnalyzeRequest, authorization: str | None = Header(defaul
         "webpageUrl": info.get("webpage_url") or source_url,
         "session": sid,
         "expiresIn": SESSION_TTL,
-        "formats": [public_format(f) for f in raw_formats],
+        "formats": [
+            ({**public_format(f), "delivery": "server", "direct": False} if native_transfer else public_format(f))
+            for f in raw_formats
+        ],
         "choices": choices,
         "previewFormatId": str(preview_format.get("format_id")) if preview_format else None,
         "previewSourceFormatId": str(preview_source.get("format_id")) if preview_source else None,
@@ -796,7 +973,8 @@ async def analyze(req: AnalyzeRequest, authorization: str | None = Header(defaul
         # faster browser-relay path and retain previewChoiceId only as fallback.
         "previewUsePrepared": bool(
             preview_choice and (
-                not preview_format
+                native_transfer
+                or not preview_format
                 or str(preview_format.get("acodec") or "").lower() == "none"
             )
         ),
@@ -857,9 +1035,11 @@ async def ensure_seekable_preview(session_id: str, format_id: str) -> Path:
     if choice and choice.get("audioFormatId") and (not audio_item or not audio_item.get("url")):
         raise HTTPException(404, "Preview audio source was not found")
 
-    await validate_public_https(item["url"])
-    if audio_item:
-        await validate_public_https(audio_item["url"])
+    native_transfer = bool(session.get("native_transfer"))
+    if not native_transfer:
+        await validate_public_https(item["url"])
+        if audio_item:
+            await validate_public_https(audio_item["url"])
 
     cache_dir = PREVIEW_CACHE_ROOT / session_id
     cache_dir.mkdir(parents=True, exist_ok=True)
@@ -879,6 +1059,24 @@ async def ensure_seekable_preview(session_id: str, format_id: str) -> Path:
         tmp_path.unlink(missing_ok=True)
         common = [FFMPEG, "-hide_banner", "-loglevel", "error", "-nostdin", "-y"]
 
+        local_video_path: Path | None = None
+        local_audio_path: Path | None = None
+        if native_transfer:
+            try:
+                native_dir = str(cache_dir / f"native-{digest}")
+                local_video_path = await ytdlp_download_format(
+                    session["source_url"],
+                    str(choice.get("videoFormatId") if choice else format_id),
+                    native_dir,
+                    "video",
+                )
+                if choice and choice.get("audioFormatId"):
+                    local_audio_path = await ytdlp_download_format(
+                        session["source_url"], str(choice["audioFormatId"]), native_dir, "audio"
+                    )
+            except Exception as e:
+                raise HTTPException(502, f"yt-dlp preview transfer failed: {e}")
+
         async def run(cmd: list[str]):
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
@@ -895,28 +1093,44 @@ async def ensure_seekable_preview(session_id: str, format_id: str) -> Path:
             return proc.returncode, stdout, stderr
 
         copy_cmd = [*common]
-        copy_cmd += ffmpeg_input_header_args(item.get("headers") or {})
-        copy_cmd += ["-i", item["url"]]
-        if audio_item:
-            copy_cmd += ffmpeg_input_header_args(audio_item.get("headers") or {})
-            copy_cmd += ["-i", audio_item["url"]]
-            copy_cmd += ["-map", "0:v:0", "-map", "1:a:0", "-shortest"]
+        if native_transfer and local_video_path:
+            copy_cmd += ["-i", str(local_video_path)]
+            if local_audio_path:
+                copy_cmd += ["-i", str(local_audio_path)]
+                copy_cmd += ["-map", "0:v:0", "-map", "1:a:0", "-shortest"]
+            else:
+                copy_cmd += ["-map", "0:v:0", "-map", "0:a:0?"]
         else:
-            copy_cmd += ["-map", "0:v:0", "-map", "0:a:0?"]
+            copy_cmd += ffmpeg_input_header_args(item.get("headers") or {})
+            copy_cmd += ["-i", item["url"]]
+            if audio_item:
+                copy_cmd += ffmpeg_input_header_args(audio_item.get("headers") or {})
+                copy_cmd += ["-i", audio_item["url"]]
+                copy_cmd += ["-map", "0:v:0", "-map", "1:a:0", "-shortest"]
+            else:
+                copy_cmd += ["-map", "0:v:0", "-map", "0:a:0?"]
         copy_cmd += ["-c", "copy", "-movflags", "+faststart", str(tmp_path)]
         code, _, stderr = await run(copy_cmd)
 
         if code != 0 or not tmp_path.exists() or tmp_path.stat().st_size <= 0:
             tmp_path.unlink(missing_ok=True)
             transcode_cmd = [*common]
-            transcode_cmd += ffmpeg_input_header_args(item.get("headers") or {})
-            transcode_cmd += ["-i", item["url"]]
-            if audio_item:
-                transcode_cmd += ffmpeg_input_header_args(audio_item.get("headers") or {})
-                transcode_cmd += ["-i", audio_item["url"]]
-                transcode_cmd += ["-map", "0:v:0", "-map", "1:a:0", "-shortest"]
+            if native_transfer and local_video_path:
+                transcode_cmd += ["-i", str(local_video_path)]
+                if local_audio_path:
+                    transcode_cmd += ["-i", str(local_audio_path)]
+                    transcode_cmd += ["-map", "0:v:0", "-map", "1:a:0", "-shortest"]
+                else:
+                    transcode_cmd += ["-map", "0:v:0", "-map", "0:a:0?"]
             else:
-                transcode_cmd += ["-map", "0:v:0", "-map", "0:a:0?"]
+                transcode_cmd += ffmpeg_input_header_args(item.get("headers") or {})
+                transcode_cmd += ["-i", item["url"]]
+                if audio_item:
+                    transcode_cmd += ffmpeg_input_header_args(audio_item.get("headers") or {})
+                    transcode_cmd += ["-i", audio_item["url"]]
+                    transcode_cmd += ["-map", "0:v:0", "-map", "1:a:0", "-shortest"]
+                else:
+                    transcode_cmd += ["-map", "0:v:0", "-map", "0:a:0?"]
             transcode_cmd += [
                 "-c:v", "libx264", "-preset", "veryfast", "-crf", "27",
                 "-c:a", "aac", "-b:a", "128k",
