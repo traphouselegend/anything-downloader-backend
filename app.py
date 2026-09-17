@@ -16,7 +16,7 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 
-APP_VERSION = "6.4.1"
+APP_VERSION = "6.4.2"
 SESSION_TTL = int(os.getenv("SESSION_TTL_SECONDS", "1800"))
 JOB_TTL = int(os.getenv("JOB_TTL_SECONDS", "1800"))
 API_KEY = os.getenv("ADAPTER_API_KEY", "").strip()
@@ -24,6 +24,7 @@ YTDLP = os.getenv("YTDLP_BIN", "/opt/venv/bin/yt-dlp")
 POT_URL = os.getenv("POT_PROVIDER_URL", "http://127.0.0.1:4416").rstrip("/")
 MAX_ANALYZE_SECONDS = int(os.getenv("MAX_ANALYZE_SECONDS", "90"))
 MAX_PREPARE_SECONDS = int(os.getenv("MAX_PREPARE_SECONDS", "900"))
+FFMPEG = os.getenv("FFMPEG_BIN", shutil.which("ffmpeg") or "ffmpeg")
 
 app = FastAPI(title="Anything Downloader Acquisition Adapter", version=APP_VERSION)
 SESSIONS: dict[str, dict[str, Any]] = {}
@@ -299,6 +300,75 @@ async def run_ytdlp(url: str) -> dict[str, Any]:
         raise HTTPException(502, "yt-dlp returned invalid JSON")
 
 
+def ffmpeg_input_header_args(headers: dict[str, Any]) -> list[str]:
+    """Convert yt-dlp request headers into safe per-input FFmpeg HTTP options."""
+    clean: list[str] = []
+    user_agent = None
+    for raw_k, raw_v in (headers or {}).items():
+        if not raw_k or raw_v is None:
+            continue
+        k = str(raw_k).strip()
+        v = str(raw_v).replace("\r", "").replace("\n", " ").strip()
+        if not k or not v:
+            continue
+        lk = k.lower()
+        # FFmpeg manages these itself; forwarding them can break HLS/DASH reads.
+        if lk in {"host", "connection", "content-length", "range", "accept-encoding"}:
+            continue
+        if lk == "user-agent":
+            user_agent = v
+            continue
+        clean.append(f"{k}: {v}")
+    out: list[str] = []
+    if user_agent:
+        out += ["-user_agent", user_agent]
+    if clean:
+        out += ["-headers", "\r\n".join(clean) + "\r\n"]
+    return out
+
+
+def build_resolved_ffmpeg_command(
+    video: dict[str, Any],
+    audio: dict[str, Any] | None,
+    output_path: str,
+    container: str,
+    start: float | None,
+    end: float | None,
+) -> list[str]:
+    """Build a command that consumes the exact streams resolved during Analyze."""
+    cmd = [FFMPEG, "-hide_banner", "-loglevel", "error", "-nostdin", "-y"]
+    clip_len = None
+    if start is not None and end is not None:
+        clip_len = max(0.0, end - start)
+
+    if start is not None:
+        cmd += ["-ss", f"{start:.3f}"]
+    cmd += ffmpeg_input_header_args(video.get("headers") or {})
+    cmd += ["-i", video["url"]]
+
+    if audio:
+        if start is not None:
+            cmd += ["-ss", f"{start:.3f}"]
+        cmd += ffmpeg_input_header_args(audio.get("headers") or {})
+        cmd += ["-i", audio["url"]]
+
+    if clip_len is not None:
+        cmd += ["-t", f"{clip_len:.3f}"]
+
+    if audio:
+        cmd += ["-map", "0:v:0", "-map", "1:a:0"]
+    else:
+        # Combined HLS/progressive streams normally expose both tracks on input 0.
+        cmd += ["-map", "0:v:0?", "-map", "0:a:0?"]
+
+    # Stream-copy first. This is cheap on a small host and preserves source quality.
+    cmd += ["-c", "copy"]
+    if container == "mp4":
+        cmd += ["-movflags", "+faststart"]
+    cmd += [output_path]
+    return cmd
+
+
 async def run_prepare(job_id: str, session_id: str, choice_id: str, start: float | None, end: float | None) -> None:
     rec = JOBS[job_id]
     session = SESSIONS.get(session_id)
@@ -310,35 +380,37 @@ async def run_prepare(job_id: str, session_id: str, choice_id: str, start: float
         rec.update(status="error", error="Unknown quality choice")
         return
 
+    streams = session.get("streams", {})
+    video = streams.get(str(choice.get("videoFormatId") or ""))
+    audio_id = choice.get("audioFormatId")
+    audio = streams.get(str(audio_id)) if audio_id else None
+    if not video or not video.get("url"):
+        rec.update(status="error", error="The resolved video stream is no longer available; analyze the URL again")
+        return
+    if audio_id and (not audio or not audio.get("url")):
+        rec.update(status="error", error="The resolved audio stream is no longer available; analyze the URL again")
+        return
+
+    # Re-check resolved media hosts before the server fetches them.
+    try:
+        await validate_public_https(video["url"])
+        if audio:
+            await validate_public_https(audio["url"])
+    except HTTPException as e:
+        rec.update(status="error", error=f"Resolved media URL was rejected: {e.detail}")
+        return
+
     directory = f"/tmp/anything-downloader-{job_id}"
     os.makedirs(directory, exist_ok=True)
     rec["directory"] = directory
-    outtmpl = os.path.join(directory, "media.%(ext)s")
-    cmd = [
-        YTDLP,
-        "--no-playlist",
-        "--no-warnings",
-        "--socket-timeout", "30",
-        "--retries", "3",
-        "--fragment-retries", "3",
-        "--concurrent-fragments", "4",
-        "--js-runtimes", "node",
-        "--format", choice["formatSelector"],
-        "--output", outtmpl,
-    ]
-    if youtube_like(session["source_url"]):
-        cmd += [
-            "--extractor-args", "youtube:player_client=default,mweb",
-            "--extractor-args", f"youtubepot-bgutilhttp:base_url={POT_URL}",
-        ]
-    if start is not None and end is not None:
-        cmd += ["--download-sections", f"*{start:.3f}-{end:.3f}"]
-    # If yt-dlp merges separate A/V streams, prefer MP4 when the selected family is MP4.
-    if choice.get("container") == "mp4":
-        cmd += ["--merge-output-format", "mp4"]
-    cmd.append(session["source_url"])
+    container = str(choice.get("container") or video.get("ext") or "mp4").lower()
+    if container not in {"mp4", "webm", "mkv", "mov", "m4v"}:
+        container = "mp4"
+    output_path = os.path.join(directory, f"media.{container}")
+    cmd = build_resolved_ffmpeg_command(video, audio, output_path, container, start, end)
 
     rec["status"] = "preparing"
+    rec["strategy"] = "resolved-stream-ffmpeg"
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         stdout=asyncio.subprocess.PIPE,
@@ -354,16 +426,15 @@ async def run_prepare(job_id: str, session_id: str, choice_id: str, start: float
         return
 
     if proc.returncode != 0:
-        detail = stderr.decode("utf-8", "replace").strip()[-3500:] or stdout.decode("utf-8", "replace").strip()[-1500:] or "yt-dlp preparation failed"
-        rec.update(status="error", error=detail)
+        detail = stderr.decode("utf-8", "replace").strip()[-3500:] or stdout.decode("utf-8", "replace").strip()[-1500:] or "FFmpeg preparation failed"
+        rec.update(status="error", error=f"Resolved-stream preparation failed: {detail}")
         return
 
-    files = [p for p in Path(directory).glob("media.*") if p.is_file() and not p.name.endswith((".part", ".ytdl"))]
-    if not files:
+    path = Path(output_path)
+    if not path.is_file() or path.stat().st_size <= 0:
         rec.update(status="error", error="Preparation finished but no output file was produced")
         return
-    path = max(files, key=lambda p: p.stat().st_size)
-    ext = path.suffix.lstrip(".") or choice.get("container") or "mp4"
+    ext = path.suffix.lstrip(".") or container
     base = safe_name(session.get("title") or "media")
     if start is not None and end is not None:
         base += f"_{int(start)}-{int(end)}"
@@ -382,7 +453,7 @@ async def run_prepare(job_id: str, session_id: str, choice_id: str, start: float
 async def health():
     return {
         "ok": True,
-        "engine": "yt-dlp-multisite+ejs+bgutil-pot",
+        "engine": "yt-dlp-multisite+resolved-stream-prep+ejs+bgutil-pot",
         "version": APP_VERSION,
         "potProvider": POT_URL,
         "serverPrepare": True,
@@ -420,23 +491,27 @@ async def analyze(req: AnalyzeRequest, authorization: str | None = Header(defaul
         raise HTTPException(422, "The source was identified, but no non-DRM video formats were available")
 
     sid = secrets.token_urlsafe(24)
-    private: dict[str, dict[str, Any]] = {}
+    streams: dict[str, dict[str, Any]] = {}
     for f in raw_formats:
-        if not is_progressive_http_format(f):
+        if not has_usable_url(f):
             continue
         fid = str(f.get("format_id") or "")
         if not fid:
             continue
-        private[fid] = {
+        streams[fid] = {
             "url": f["url"],
             "headers": f.get("http_headers") or {},
             "mime": f.get("mime_type") or ("video/webm" if f.get("ext") == "webm" else "video/mp4"),
             "ext": f.get("ext") or "bin",
+            "protocol": f.get("protocol"),
+            "hasVideo": f.get("vcodec") not in {None, "none"},
+            "hasAudio": f.get("acodec") not in {None, "none"},
         }
     choice_map = {c["id"]: c for c in choices}
     SESSIONS[sid] = {
         "expires": time.time() + SESSION_TTL,
-        "formats": private,
+        "formats": {k: v for k, v in streams.items() if str(v.get("protocol") or "").lower() in {"https", "http", "https_native", "http_native"}},
+        "streams": streams,
         "choices": choice_map,
         "source_url": source_url,
         "title": info.get("title") or "media",
@@ -473,6 +548,7 @@ async def media(session: str, format_id: str, request: Request, authorization: s
     item = s["formats"].get(format_id)
     if not item:
         raise HTTPException(404, "This format is not a progressive browser-relay format")
+    await validate_public_https(item["url"])
 
     headers = {str(k): str(v) for k, v in (item.get("headers") or {}).items() if k and v}
     if request.headers.get("range"):
