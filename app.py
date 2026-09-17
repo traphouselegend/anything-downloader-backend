@@ -16,7 +16,7 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 
-APP_VERSION = "6.4.2"
+APP_VERSION = "6.4.3"
 SESSION_TTL = int(os.getenv("SESSION_TTL_SECONDS", "1800"))
 JOB_TTL = int(os.getenv("JOB_TTL_SECONDS", "1800"))
 API_KEY = os.getenv("ADAPTER_API_KEY", "").strip()
@@ -507,6 +507,34 @@ async def analyze(req: AnalyzeRequest, authorization: str | None = Header(defaul
             "hasVideo": f.get("vcodec") not in {None, "none"},
             "hasAudio": f.get("acodec") not in {None, "none"},
         }
+    # Prefer a lightweight progressive HTTP video as the browser preview source,
+    # even when yt-dlp did not populate codec metadata for that direct format.
+    # This keeps preview/seek traffic in the browser while HLS/DASH stays on the
+    # resolved-stream server-prep path for the actual selected download quality.
+    preview_candidates = []
+    for f in raw_formats:
+        if not has_usable_url(f) or not is_progressive_http_format(f):
+            continue
+        try:
+            h = int(f.get("height") or 0)
+        except Exception:
+            h = 0
+        ext = str(f.get("ext") or "").lower()
+        if h <= 0 or ext not in {"mp4", "webm", "m4v", "mov"}:
+            continue
+        preview_candidates.append(f)
+
+    preview_format = None
+    if preview_candidates:
+        # 480p is a good preview target: quick to start but clear enough to seek.
+        # Prefer formats with explicit video/audio metadata when two candidates tie.
+        def preview_score(f):
+            h = int(f.get("height") or 0)
+            metadata_penalty = 0 if f.get("vcodec") not in {None, "none"} else 1
+            audio_penalty = 0 if f.get("acodec") not in {None, "none"} else 1
+            return (abs(h - 480), metadata_penalty, audio_penalty, h)
+        preview_format = min(preview_candidates, key=preview_score)
+
     choice_map = {c["id"]: c for c in choices}
     SESSIONS[sid] = {
         "expires": time.time() + SESSION_TTL,
@@ -533,6 +561,9 @@ async def analyze(req: AnalyzeRequest, authorization: str | None = Header(defaul
         "expiresIn": SESSION_TTL,
         "formats": [public_format(f) for f in raw_formats],
         "choices": choices,
+        "previewFormatId": str(preview_format.get("format_id")) if preview_format else None,
+        "previewHeight": int(preview_format.get("height") or 0) if preview_format else None,
+        "previewExt": preview_format.get("ext") if preview_format else None,
         "browserChoiceCount": sum(1 for c in choices if c["delivery"] == "browser"),
         "serverChoiceCount": sum(1 for c in choices if c["delivery"] == "server"),
     }
