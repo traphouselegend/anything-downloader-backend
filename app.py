@@ -16,7 +16,7 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 
-APP_VERSION = "6.4.5"
+APP_VERSION = "6.4.6"
 SESSION_TTL = int(os.getenv("SESSION_TTL_SECONDS", "1800"))
 JOB_TTL = int(os.getenv("JOB_TTL_SECONDS", "1800"))
 API_KEY = os.getenv("ADAPTER_API_KEY", "").strip()
@@ -148,8 +148,8 @@ def public_format(f: dict[str, Any]) -> dict[str, Any]:
         "tbr": f.get("tbr"),
         "abr": f.get("abr"),
         "filesize": f.get("filesize") or f.get("filesize_approx"),
-        "hasVideo": f.get("vcodec") not in {None, "none"},
-        "hasAudio": f.get("acodec") not in {None, "none"},
+        "hasVideo": is_video_format(f),
+        "hasAudio": (str(f.get("acodec") or "").lower() != "none" and (f.get("acodec") not in {None, ""} or is_progressive_http_format(f))),
         "delivery": delivery,
         "direct": delivery == "browser",
         "hasDrm": bool(f.get("has_drm")),
@@ -186,10 +186,34 @@ def audio_score(f: dict[str, Any], preferred_family: str) -> float:
     return score
 
 
+def is_video_format(f: dict[str, Any]) -> bool:
+    """Treat missing codec metadata as unknown, not audio-only.
+
+    Several yt-dlp extractors (notably Twitch Clips) return direct video
+    qualities with URL/height/FPS but omit vcodec/acodec. Only an explicit
+    vcodec == "none" is reliable evidence that a format is audio-only.
+    """
+    vcodec = f.get("vcodec")
+    if isinstance(vcodec, str) and vcodec.lower() == "none":
+        return False
+    if vcodec not in {None, ""}:
+        return True
+    if f.get("height") or f.get("width"):
+        return True
+    ext = str(f.get("ext") or "").lower()
+    return ext in {"mp4", "webm", "mov", "m4v", "flv", "ts"}
+
+
+def is_audio_only_format(f: dict[str, Any]) -> bool:
+    vcodec = f.get("vcodec")
+    acodec = f.get("acodec")
+    return isinstance(vcodec, str) and vcodec.lower() == "none" and acodec not in {None, "", "none"}
+
+
 def make_choices(formats: list[dict[str, Any]]) -> list[dict[str, Any]]:
     usable = [f for f in formats if has_usable_url(f)]
-    video = [f for f in usable if f.get("vcodec") not in {None, "none"} and f.get("height")]
-    audio = [f for f in usable if f.get("vcodec") in {None, "none"} and f.get("acodec") not in {None, "none"}]
+    video = [f for f in usable if is_video_format(f) and f.get("height")]
+    audio = [f for f in usable if is_audio_only_format(f)]
     by_height: dict[int, list[dict[str, Any]]] = {}
     for f in video:
         by_height.setdefault(int(f["height"]), []).append(f)
@@ -197,11 +221,18 @@ def make_choices(formats: list[dict[str, Any]]) -> list[dict[str, Any]]:
     choices: list[dict[str, Any]] = []
     for height in sorted(by_height, reverse=True):
         candidates = sorted(by_height[height], key=codec_score, reverse=True)
-        combined = [f for f in candidates if f.get("acodec") not in {None, "none"}]
+        combined = [
+            f for f in candidates
+            if f.get("acodec") not in {None, "none"}
+            or (is_progressive_http_format(f) and f.get("acodec") is None)
+        ]
         chosen = combined[0] if combined else candidates[0]
         family = "webm" if str(chosen.get("ext") or "").lower() == "webm" else "mp4"
         audio_f = None
-        if chosen.get("acodec") in {None, "none"} and audio:
+        # Missing acodec on a progressive video is "unknown", not proof that
+        # audio is absent. Twitch Clip MP4s are a common example. Only pair a
+        # separate audio stream when the chosen format explicitly says acodec=none.
+        if str(chosen.get("acodec") or "").lower() == "none" and audio:
             audio_f = max(audio, key=lambda f: audio_score(f, family))
 
         browser_delivery = is_progressive_http_format(chosen) and (audio_f is None or is_progressive_http_format(audio_f))
@@ -224,7 +255,7 @@ def make_choices(formats: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "audioFormatId": audio_id,
             "videoExt": chosen.get("ext") or ext,
             "audioExt": audio_f.get("ext") if audio_f else None,
-            "combined": audio_f is None and chosen.get("acodec") not in {None, "none"},
+            "combined": audio_f is None and (chosen.get("acodec") not in {"none"}),
             "filesize": size or None,
             "delivery": delivery,
             "formatSelector": selector,
@@ -504,8 +535,8 @@ async def analyze(req: AnalyzeRequest, authorization: str | None = Header(defaul
             "mime": f.get("mime_type") or ("video/webm" if f.get("ext") == "webm" else "video/mp4"),
             "ext": f.get("ext") or "bin",
             "protocol": f.get("protocol"),
-            "hasVideo": f.get("vcodec") not in {None, "none"},
-            "hasAudio": f.get("acodec") not in {None, "none"},
+            "hasVideo": is_video_format(f),
+            "hasAudio": (str(f.get("acodec") or "").lower() != "none" and (f.get("acodec") not in {None, ""} or is_progressive_http_format(f))),
         }
     # Prefer a lightweight progressive HTTP video as the browser preview source,
     # even when yt-dlp did not populate codec metadata for that direct format.
