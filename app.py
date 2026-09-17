@@ -16,7 +16,7 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 
-APP_VERSION = "6.4.6"
+APP_VERSION = "6.4.7"
 SESSION_TTL = int(os.getenv("SESSION_TTL_SECONDS", "1800"))
 JOB_TTL = int(os.getenv("JOB_TTL_SECONDS", "1800"))
 API_KEY = os.getenv("ADAPTER_API_KEY", "").strip()
@@ -106,6 +106,58 @@ async def validate_public_https(raw: str) -> str:
             pass
     return raw
 
+
+
+
+def infer_ext_from_url(url: str) -> str | None:
+    try:
+        suffix = Path(urlparse(url).path).suffix.lower().lstrip(".")
+    except Exception:
+        return None
+    return suffix if suffix in {"mp4", "webm", "mov", "m4v", "flv", "ts", "m3u8", "mp3", "m4a", "aac", "opus", "ogg"} else None
+
+
+def normalize_sparse_formats(info: dict[str, Any], formats: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Fill only metadata needed by our delivery layer when an extractor is sparse.
+
+    Some extractors (notably Kick Clips) may legally return a format containing
+    little more than a direct URL. yt-dlp can still download it, so absence of
+    format_id/height/protocol must not make us discard the media.
+    """
+    out: list[dict[str, Any]] = []
+    used_ids: set[str] = set()
+    for idx, original in enumerate(formats, 1):
+        f = dict(original)
+        url = f.get("url")
+        if isinstance(url, str):
+            guessed_ext = infer_ext_from_url(url)
+            if not f.get("ext"):
+                f["ext"] = guessed_ext or info.get("ext")
+            if not f.get("protocol"):
+                if str(f.get("ext") or guessed_ext or "").lower() == "m3u8":
+                    f["protocol"] = "m3u8_native"
+                elif url.startswith("https://"):
+                    f["protocol"] = "https"
+                elif url.startswith("http://"):
+                    f["protocol"] = "http"
+
+        if not f.get("height") and info.get("height"):
+            f["height"] = info.get("height")
+        if not f.get("width") and info.get("width"):
+            f["width"] = info.get("width")
+
+        fid = str(f.get("format_id") or "").strip()
+        if not fid:
+            fid = "source" if len(formats) == 1 else f"source-{idx}"
+        base = fid
+        n = 2
+        while fid in used_ids:
+            fid = f"{base}-{n}"
+            n += 1
+        used_ids.add(fid)
+        f["format_id"] = fid
+        out.append(f)
+    return out
 
 def protocol_name(f: dict[str, Any]) -> str:
     return str(f.get("protocol") or "").lower()
@@ -213,6 +265,7 @@ def is_audio_only_format(f: dict[str, Any]) -> bool:
 def make_choices(formats: list[dict[str, Any]]) -> list[dict[str, Any]]:
     usable = [f for f in formats if has_usable_url(f)]
     video = [f for f in usable if is_video_format(f) and f.get("height")]
+    unranked_video = [f for f in usable if is_video_format(f) and not f.get("height")]
     audio = [f for f in usable if is_audio_only_format(f)]
     by_height: dict[int, list[dict[str, Any]]] = {}
     for f in video:
@@ -259,6 +312,31 @@ def make_choices(formats: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "filesize": size or None,
             "delivery": delivery,
             "formatSelector": selector,
+        })
+
+    # Some extractors expose one direct video file without any resolution metadata.
+    # A missing height is not a reason to make that otherwise-valid source unusable.
+    if not choices and unranked_video:
+        chosen = max(unranked_video, key=codec_score)
+        family = "webm" if str(chosen.get("ext") or "").lower() == "webm" else "mp4"
+        video_id = str(chosen.get("format_id") or "source")
+        browser_delivery = is_progressive_http_format(chosen)
+        choices.append({
+            "id": f"source-{video_id}",
+            "label": chosen.get("format_note") or chosen.get("resolution") or "Source",
+            "height": None,
+            "fps": chosen.get("fps"),
+            "container": family,
+            "videoCodec": chosen.get("vcodec"),
+            "audioCodec": chosen.get("acodec"),
+            "videoFormatId": video_id,
+            "audioFormatId": None,
+            "videoExt": chosen.get("ext") or family,
+            "audioExt": None,
+            "combined": True,
+            "filesize": chosen.get("filesize") or chosen.get("filesize_approx"),
+            "delivery": "browser" if browser_delivery else "server",
+            "formatSelector": video_id,
         })
     return choices
 
@@ -517,6 +595,7 @@ async def analyze(req: AnalyzeRequest, authorization: str | None = Header(defaul
                 info = {**entry, "webpage_url": entry.get("webpage_url") or source_url}
                 raw_formats = [entry]
                 break
+    raw_formats = normalize_sparse_formats(info, raw_formats)
     choices = make_choices(raw_formats)
     if not choices:
         raise HTTPException(422, "The source was identified, but no non-DRM video formats were available")
@@ -551,7 +630,7 @@ async def analyze(req: AnalyzeRequest, authorization: str | None = Header(defaul
         except Exception:
             h = 0
         ext = str(f.get("ext") or "").lower()
-        if h <= 0 or ext not in {"mp4", "webm", "m4v", "mov"}:
+        if ext not in {"mp4", "webm", "m4v", "mov"}:
             continue
         preview_candidates.append(f)
 
