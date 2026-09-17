@@ -16,7 +16,7 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 
-APP_VERSION = "6.4"
+APP_VERSION = "6.4.1"
 SESSION_TTL = int(os.getenv("SESSION_TTL_SECONDS", "1800"))
 JOB_TTL = int(os.getenv("JOB_TTL_SECONDS", "1800"))
 API_KEY = os.getenv("ADAPTER_API_KEY", "").strip()
@@ -240,7 +240,7 @@ def youtube_like(url: str) -> bool:
 
 
 async def run_ytdlp(url: str) -> dict[str, Any]:
-    cmd = [
+    base_cmd = [
         YTDLP,
         "--dump-single-json",
         "--skip-download",
@@ -252,26 +252,45 @@ async def run_ytdlp(url: str) -> dict[str, Any]:
         "--js-runtimes", "node",
     ]
     if youtube_like(url):
-        cmd += [
+        base_cmd += [
             "--extractor-args", "youtube:player_client=default,mweb",
             "--extractor-args", f"youtubepot-bgutilhttp:base_url={POT_URL}",
         ]
-    cmd.append(url)
-    proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        env={**os.environ, "PYTHONUNBUFFERED": "1"},
-    )
-    try:
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=MAX_ANALYZE_SECONDS)
-    except asyncio.TimeoutError:
-        proc.kill()
-        await proc.communicate()
-        raise HTTPException(504, "Media analysis timed out")
-    if proc.returncode != 0:
-        detail = stderr.decode("utf-8", "replace").strip()[-3000:] or "yt-dlp failed"
+
+    async def attempt(extra: list[str] | None = None):
+        cmd = [*base_cmd, *(extra or []), url]
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env={**os.environ, "PYTHONUNBUFFERED": "1"},
+        )
+        try:
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=MAX_ANALYZE_SECONDS)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.communicate()
+            raise HTTPException(504, "Media analysis timed out")
+        return proc.returncode, stdout, stderr.decode("utf-8", "replace").strip()
+
+    code, stdout, detail = await attempt()
+
+    # yt-dlp's generic extractor intentionally does not impersonate by default.
+    # When it specifically reports a Cloudflare/browser-fingerprint challenge,
+    # retry once with generic impersonation now that curl_cffi is installed.
+    low = detail.lower()
+    if code != 0 and not youtube_like(url) and (
+        "generic:impersonate" in low
+        or "cloudflare anti-bot challenge" in low
+        or ("impersonat" in low and "unavailable" not in low)
+    ):
+        code, stdout, detail2 = await attempt(["--extractor-args", "generic:impersonate"])
+        if detail2:
+            detail = detail2
         low = detail.lower()
+
+    if code != 0:
+        detail = detail[-3000:] or "yt-dlp failed"
         status = 429 if "confirm you’re not a bot" in low or "confirm you're not a bot" in low else 502
         raise HTTPException(status, detail)
     try:
@@ -377,6 +396,25 @@ async def analyze(req: AnalyzeRequest, authorization: str | None = Header(defaul
     source_url = await validate_public_https(req.url)
     info = await run_ytdlp(source_url)
     raw_formats = [f for f in info.get("formats", []) if isinstance(f, dict)]
+    # Some yt-dlp extractors return a single top-level media format instead of formats[].
+    # Normalize that shape so supported sites are not rejected merely because they expose
+    # one playable stream.
+    if not raw_formats and isinstance(info.get("url"), str):
+        raw_formats = [info]
+    # A few generic/embed extractors can return a one-entry result wrapper.
+    if not raw_formats and isinstance(info.get("entries"), list):
+        for entry in info.get("entries") or []:
+            if not isinstance(entry, dict):
+                continue
+            nested = [f for f in entry.get("formats", []) if isinstance(f, dict)]
+            if nested:
+                info = {**entry, "webpage_url": entry.get("webpage_url") or source_url}
+                raw_formats = nested
+                break
+            if isinstance(entry.get("url"), str):
+                info = {**entry, "webpage_url": entry.get("webpage_url") or source_url}
+                raw_formats = [entry]
+                break
     choices = make_choices(raw_formats)
     if not choices:
         raise HTTPException(422, "The source was identified, but no non-DRM video formats were available")
