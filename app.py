@@ -19,7 +19,7 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 
-APP_VERSION = "6.5.1"
+APP_VERSION = "6.5.2"
 SESSION_TTL = int(os.getenv("SESSION_TTL_SECONDS", "1800"))
 JOB_TTL = int(os.getenv("JOB_TTL_SECONDS", "1800"))
 API_KEY = os.getenv("ADAPTER_API_KEY", "").strip()
@@ -48,6 +48,7 @@ class PrepareRequest(BaseModel):
     choiceId: str
     start: float | None = None
     end: float | None = None
+    outputCodec: str | None = None
 
 
 def require_auth(authorization: str | None) -> None:
@@ -392,6 +393,37 @@ def codec_label(family: str, raw: Any = None) -> str:
         "av1": "AV1",
         "vp9": "VP9",
     }.get(family, str(raw or "Source codec"))
+
+
+def normalize_output_codec(value: Any) -> str | None:
+    v = str(value or "").strip().lower().replace(".", "")
+    if v in {"h264", "avc", "avc1", "264"}:
+        return "h264"
+    if v in {"h265", "hevc", "hvc1", "hev1", "265"}:
+        return "h265"
+    return None
+
+
+def video_transcode_args(target_codec: str) -> list[str]:
+    """Encoder settings used only for explicit codec conversion."""
+    if target_codec == "h265":
+        return [
+            "-c:v", "libx265",
+            "-preset", "veryfast",
+            "-crf", "25",
+            "-tag:v", "hvc1",
+            "-pix_fmt", "yuv420p",
+            "-c:a", "aac",
+            "-b:a", "192k",
+        ]
+    return [
+        "-c:v", "libx264",
+        "-preset", "veryfast",
+        "-crf", "20",
+        "-pix_fmt", "yuv420p",
+        "-c:a", "aac",
+        "-b:a", "192k",
+    ]
 
 
 def choose_audio_donor(
@@ -748,6 +780,7 @@ def build_resolved_ffmpeg_command(
     container: str,
     start: float | None,
     end: float | None,
+    target_codec: str | None = None,
 ) -> list[str]:
     """Build a command that consumes the exact streams resolved during Analyze."""
     cmd = [FFMPEG, "-hide_banner", "-loglevel", "error", "-nostdin", "-y"]
@@ -772,18 +805,19 @@ def build_resolved_ffmpeg_command(
     if audio:
         cmd += ["-map", "0:v:0", "-map", "1:a:0"]
     else:
-        # Combined HLS/progressive streams normally expose both tracks on input 0.
         cmd += ["-map", "0:v:0?", "-map", "0:a:0?"]
 
-    # Stream-copy first. This is cheap on a small host and preserves source quality.
-    cmd += ["-c", "copy"]
+    if target_codec:
+        cmd += video_transcode_args(target_codec)
+    else:
+        cmd += ["-c", "copy"]
     if container == "mp4":
         cmd += ["-movflags", "+faststart"]
     cmd += [output_path]
     return cmd
 
 
-async def run_native_transfer_prepare(job_id: str, session_id: str, choice_id: str, start: float | None, end: float | None) -> None:
+async def run_native_transfer_prepare(job_id: str, session_id: str, choice_id: str, start: float | None, end: float | None, output_codec: str | None = None) -> None:
     """Prepare a choice by letting yt-dlp itself fetch the selected formats.
 
     This is intentionally used only for extractors such as TikTok where the
@@ -820,7 +854,9 @@ async def run_native_transfer_prepare(job_id: str, session_id: str, choice_id: s
         return
 
     container = str(choice.get("container") or "mp4").lower()
-    if container not in {"mp4", "webm", "mkv", "mov", "m4v"}:
+    if output_codec:
+        container = "mp4"
+    elif container not in {"mp4", "webm", "mkv", "mov", "m4v"}:
         container = "mp4"
     output_path = os.path.join(directory, f"media.{container}")
     cmd = [FFMPEG, "-hide_banner", "-loglevel", "error", "-nostdin", "-y"]
@@ -839,7 +875,11 @@ async def run_native_transfer_prepare(job_id: str, session_id: str, choice_id: s
         cmd += ["-map", "0:v:0", "-map", "1:a:0", "-shortest"]
     else:
         cmd += ["-map", "0:v:0?", "-map", "0:a:0?"]
-    cmd += ["-c", "copy"]
+    if output_codec:
+        rec.update(phase=f"Converting video to {codec_label(output_codec)}", progress=18)
+        cmd += video_transcode_args(output_codec)
+    else:
+        cmd += ["-c", "copy"]
     if container == "mp4":
         cmd += ["-movflags", "+faststart"]
     cmd += [output_path]
@@ -865,6 +905,8 @@ async def run_native_transfer_prepare(job_id: str, session_id: str, choice_id: s
         rec.update(status="error", error="Preparation finished but no output file was produced")
         return
     base = safe_name(session.get("title") or "media")
+    if output_codec:
+        base += f"_{output_codec}"
     if start is not None and end is not None:
         base += f"_{int(start)}-{int(end)}"
     filename = f"{base}.{container}"
@@ -1007,7 +1049,7 @@ async def run_audio_prepare(job_id: str, session_id: str, choice_id: str, start:
     )
 
 
-async def run_prepare(job_id: str, session_id: str, choice_id: str, start: float | None, end: float | None) -> None:
+async def run_prepare(job_id: str, session_id: str, choice_id: str, start: float | None, end: float | None, output_codec: str | None = None) -> None:
     rec = JOBS[job_id]
     session = SESSIONS.get(session_id)
     if not session:
@@ -1024,7 +1066,7 @@ async def run_prepare(job_id: str, session_id: str, choice_id: str, start: float
         return
 
     if session.get("native_transfer"):
-        await run_native_transfer_prepare(job_id, session_id, choice_id, start, end)
+        await run_native_transfer_prepare(job_id, session_id, choice_id, start, end, output_codec)
         return
 
     streams = session.get("streams", {})
@@ -1051,13 +1093,17 @@ async def run_prepare(job_id: str, session_id: str, choice_id: str, start: float
     os.makedirs(directory, exist_ok=True)
     rec["directory"] = directory
     container = str(choice.get("container") or video.get("ext") or "mp4").lower()
-    if container not in {"mp4", "webm", "mkv", "mov", "m4v"}:
+    if output_codec:
+        container = "mp4"
+    elif container not in {"mp4", "webm", "mkv", "mov", "m4v"}:
         container = "mp4"
     output_path = os.path.join(directory, f"media.{container}")
-    cmd = build_resolved_ffmpeg_command(video, audio, output_path, container, start, end)
+    cmd = build_resolved_ffmpeg_command(video, audio, output_path, container, start, end, output_codec)
 
     rec["status"] = "preparing"
-    rec["strategy"] = "resolved-stream-ffmpeg"
+    rec["strategy"] = "video-transcode" if output_codec else "resolved-stream-ffmpeg"
+    if output_codec:
+        rec.update(phase=f"Converting video to {codec_label(output_codec)}", progress=18)
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         stdout=asyncio.subprocess.PIPE,
@@ -1083,6 +1129,8 @@ async def run_prepare(job_id: str, session_id: str, choice_id: str, start: float
         return
     ext = path.suffix.lstrip(".") or container
     base = safe_name(session.get("title") or "media")
+    if output_codec:
+        base += f"_{output_codec}"
     if start is not None and end is not None:
         base += f"_{int(start)}-{int(end)}"
     filename = f"{base}.{ext}"
@@ -1508,7 +1556,17 @@ async def prepare(req: PrepareRequest, authorization: str | None = Header(defaul
     audio_choice = session.get("audio_choices", {}).get(req.choiceId)
     if not choice and not audio_choice:
         raise HTTPException(404, "Unknown quality choice")
-    if choice and choice.get("delivery") != "server":
+
+    output_codec = normalize_output_codec(req.outputCodec)
+    if req.outputCodec and not output_codec:
+        raise HTTPException(400, "outputCodec must be h264 or h265")
+    if audio_choice and output_codec:
+        raise HTTPException(400, "Video codec conversion is not valid for audio-only output")
+
+    needs_codec_conversion = bool(
+        choice and output_codec and str(choice.get("codecFamily") or "").lower() != output_codec
+    )
+    if choice and choice.get("delivery") != "server" and not needs_codec_conversion:
         raise HTTPException(400, "This quality does not require server-side preparation")
 
     start = req.start
@@ -1531,8 +1589,9 @@ async def prepare(req: PrepareRequest, authorization: str | None = Header(defaul
         "status": "queued",
         "session": req.session,
         "choiceId": req.choiceId,
+        "outputCodec": output_codec,
     }
-    task = asyncio.create_task(run_prepare(job_id, req.session, req.choiceId, start, end))
+    task = asyncio.create_task(run_prepare(job_id, req.session, req.choiceId, start, end, output_codec))
     ACTIVE_TASKS.add(task)
     task.add_done_callback(ACTIVE_TASKS.discard)
     return {"ok": True, "job": job_id, "status": "queued", "expiresIn": JOB_TTL}
