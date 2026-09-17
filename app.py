@@ -19,7 +19,7 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 
-APP_VERSION = "6.4.12"
+APP_VERSION = "6.5.0"
 SESSION_TTL = int(os.getenv("SESSION_TTL_SECONDS", "1800"))
 JOB_TTL = int(os.getenv("JOB_TTL_SECONDS", "1800"))
 API_KEY = os.getenv("ADAPTER_API_KEY", "").strip()
@@ -372,15 +372,59 @@ def is_audio_only_format(f: dict[str, Any]) -> bool:
     return isinstance(vcodec, str) and vcodec.lower() == "none" and acodec not in {None, "", "none"}
 
 
+def video_codec_family(f: dict[str, Any]) -> str:
+    v = str(f.get("vcodec") or "").lower()
+    if any(x in v for x in ("h265", "hevc", "hvc1", "hev1", "bytevc1")):
+        return "h265"
+    if v.startswith("avc1") or "h264" in v or v.startswith("avc"):
+        return "h264"
+    if "av01" in v:
+        return "av1"
+    if "vp9" in v or v.startswith("vp0"):
+        return "vp9"
+    return "other"
+
+
+def codec_label(family: str, raw: Any = None) -> str:
+    return {
+        "h264": "H.264",
+        "h265": "H.265",
+        "av1": "AV1",
+        "vp9": "VP9",
+    }.get(family, str(raw or "Source codec"))
+
+
+def choose_audio_donor(
+    chosen: dict[str, Any],
+    audio_only: list[dict[str, Any]],
+    combined_audio_donors: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    family = "webm" if str(chosen.get("ext") or "").lower() == "webm" else "mp4"
+    if audio_only:
+        return max(audio_only, key=lambda f: audio_score(f, family))
+    if not combined_audio_donors:
+        return None
+
+    def donor_score(f):
+        ext = str(f.get("ext") or "").lower()
+        acodec = str(f.get("acodec") or "").lower()
+        family_match = (
+            family == "mp4" and (ext in {"mp4", "m4a"} or "aac" in acodec or "mp4a" in acodec)
+        ) or (
+            family == "webm" and (ext == "webm" or "opus" in acodec or "vorbis" in acodec)
+        )
+        size = int(f.get("filesize") or f.get("filesize_approx") or 2**62)
+        height = int(f.get("height") or 0)
+        return (0 if family_match else 1, size, height)
+
+    return min(combined_audio_donors, key=donor_score)
+
+
 def make_choices(formats: list[dict[str, Any]]) -> list[dict[str, Any]]:
     usable = [f for f in formats if has_usable_url(f)]
     video = [f for f in usable if is_video_format(f) and quality_dimension(f)]
     unranked_video = [f for f in usable if is_video_format(f) and not quality_dimension(f)]
     audio = [f for f in usable if is_audio_only_format(f)]
-    # Some sites expose their highest resolutions as video-only but also return
-    # a lower-resolution combined file containing a perfectly usable audio track.
-    # That combined file can safely act as an audio donor when no audio-only
-    # format exists; FFmpeg maps only its audio stream.
     combined_audio_donors = [
         f for f in usable
         if is_video_format(f) and str(f.get("acodec") or "").lower() not in {"", "none"}
@@ -394,69 +438,63 @@ def make_choices(formats: list[dict[str, Any]]) -> list[dict[str, Any]]:
     choices: list[dict[str, Any]] = []
     for height in sorted(by_height, reverse=True):
         candidates = sorted(by_height[height], key=codec_score, reverse=True)
-        combined = [
-            f for f in candidates
-            if f.get("acodec") not in {None, "none"}
-            or (is_progressive_http_format(f) and f.get("acodec") is None)
-        ]
-        chosen = combined[0] if combined else candidates[0]
-        family = "webm" if str(chosen.get("ext") or "").lower() == "webm" else "mp4"
-        audio_f = None
-        # Missing acodec on a progressive video is "unknown", not proof that
-        # audio is absent. Twitch Clip MP4s are a common example. Only pair a
-        # separate audio stream when the chosen format explicitly says acodec=none.
-        if str(chosen.get("acodec") or "").lower() == "none":
-            if audio:
-                audio_f = max(audio, key=lambda f: audio_score(f, family))
-            elif combined_audio_donors:
-                def donor_score(f):
-                    ext = str(f.get("ext") or "").lower()
-                    acodec = str(f.get("acodec") or "").lower()
-                    family_match = (
-                        family == "mp4" and (ext in {"mp4", "m4a"} or "aac" in acodec or "mp4a" in acodec)
-                    ) or (
-                        family == "webm" and (ext == "webm" or "opus" in acodec or "vorbis" in acodec)
-                    )
-                    size = int(f.get("filesize") or f.get("filesize_approx") or 2**62)
-                    height = int(f.get("height") or 0)
-                    # Prefer compatible containers/codecs, then the smallest donor
-                    # because only its audio stream is needed.
-                    return (0 if family_match else 1, size, height)
-                audio_f = min(combined_audio_donors, key=donor_score)
+        families: dict[str, list[dict[str, Any]]] = {}
+        for f in candidates:
+            families.setdefault(video_codec_family(f), []).append(f)
 
-        browser_delivery = is_progressive_http_format(chosen) and (audio_f is None or is_progressive_http_format(audio_f))
-        delivery = "browser" if browser_delivery else "server"
-        ext = "webm" if family == "webm" else "mp4"
-        size = (chosen.get("filesize") or chosen.get("filesize_approx") or 0) + ((audio_f or {}).get("filesize") or (audio_f or {}).get("filesize_approx") or 0)
-        video_id = str(chosen.get("format_id"))
-        audio_id = str(audio_f.get("format_id")) if audio_f else None
-        selector = f"{video_id}+{audio_id}" if audio_id else video_id
-        cid = f"{height}-{video_id}" + (f"-{audio_id}" if audio_id else "")
-        choices.append({
-            "id": cid,
-            "label": f"{height}p" + (" (4K)" if height >= 2160 else ""),
-            "height": height,
-            "fps": chosen.get("fps"),
-            "container": ext,
-            "videoCodec": chosen.get("vcodec"),
-            "audioCodec": chosen.get("acodec") if not audio_f else audio_f.get("acodec"),
-            "videoFormatId": video_id,
-            "audioFormatId": audio_id,
-            "videoExt": chosen.get("ext") or ext,
-            "audioExt": audio_f.get("ext") if audio_f else None,
-            "combined": audio_f is None and (chosen.get("acodec") not in {"none"}),
-            "filesize": size or None,
-            "delivery": delivery,
-            "formatSelector": selector,
-        })
+        # If H.264 and H.265 are both present at the same resolution, expose both.
+        # Otherwise keep the best available codec so existing site behavior stays compact.
+        ordered_families = [x for x in ("h264", "h265") if x in families]
+        if not ordered_families:
+            ordered_families = [video_codec_family(candidates[0])]
 
-    # Some extractors expose one direct video file without any resolution metadata.
-    # A missing height is not a reason to make that otherwise-valid source unusable.
+        for codec_family in ordered_families:
+            group = families[codec_family]
+            combined = [
+                f for f in group
+                if f.get("acodec") not in {None, "none"}
+                or (is_progressive_http_format(f) and f.get("acodec") is None)
+            ]
+            chosen = combined[0] if combined else group[0]
+            family = "webm" if str(chosen.get("ext") or "").lower() == "webm" else "mp4"
+            audio_f = None
+            if str(chosen.get("acodec") or "").lower() == "none":
+                audio_f = choose_audio_donor(chosen, audio, combined_audio_donors)
+
+            browser_delivery = is_progressive_http_format(chosen) and (audio_f is None or is_progressive_http_format(audio_f))
+            delivery = "browser" if browser_delivery else "server"
+            ext = "webm" if family == "webm" else "mp4"
+            size = (chosen.get("filesize") or chosen.get("filesize_approx") or 0) + ((audio_f or {}).get("filesize") or (audio_f or {}).get("filesize_approx") or 0)
+            video_id = str(chosen.get("format_id"))
+            audio_id = str(audio_f.get("format_id")) if audio_f else None
+            selector = f"{video_id}+{audio_id}" if audio_id else video_id
+            cid = f"{height}-{codec_family}-{video_id}" + (f"-{audio_id}" if audio_id else "")
+            choices.append({
+                "id": cid,
+                "label": f"{height}p" + (" (4K)" if height >= 2160 else ""),
+                "height": height,
+                "fps": chosen.get("fps"),
+                "container": ext,
+                "videoCodec": chosen.get("vcodec"),
+                "codecFamily": codec_family,
+                "codecLabel": codec_label(codec_family, chosen.get("vcodec")),
+                "audioCodec": chosen.get("acodec") if not audio_f else audio_f.get("acodec"),
+                "videoFormatId": video_id,
+                "audioFormatId": audio_id,
+                "videoExt": chosen.get("ext") or ext,
+                "audioExt": audio_f.get("ext") if audio_f else None,
+                "combined": audio_f is None and (chosen.get("acodec") not in {"none"}),
+                "filesize": size or None,
+                "delivery": delivery,
+                "formatSelector": selector,
+            })
+
     if not choices and unranked_video:
         chosen = max(unranked_video, key=codec_score)
         family = "webm" if str(chosen.get("ext") or "").lower() == "webm" else "mp4"
         video_id = str(chosen.get("format_id") or "source")
         browser_delivery = is_progressive_http_format(chosen)
+        cf = video_codec_family(chosen)
         choices.append({
             "id": f"source-{video_id}",
             "label": chosen.get("format_note") or chosen.get("resolution") or "Source",
@@ -464,6 +502,8 @@ def make_choices(formats: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "fps": chosen.get("fps"),
             "container": family,
             "videoCodec": chosen.get("vcodec"),
+            "codecFamily": cf,
+            "codecLabel": codec_label(cf, chosen.get("vcodec")),
             "audioCodec": chosen.get("acodec"),
             "videoFormatId": video_id,
             "audioFormatId": None,
@@ -475,6 +515,59 @@ def make_choices(formats: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "formatSelector": video_id,
         })
     return choices
+
+
+def make_audio_choices(formats: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    usable = [f for f in formats if has_usable_url(f)]
+    audio_only = [f for f in usable if is_audio_only_format(f)]
+    combined = [
+        f for f in usable
+        if is_video_format(f) and str(f.get("acodec") or "").lower() not in {"", "none"}
+    ]
+    pool = audio_only or combined
+    if not pool:
+        return []
+
+    source = max(pool, key=lambda f: audio_score(f, "mp4"))
+    source_id = str(source.get("format_id") or "")
+    if not source_id:
+        return []
+    acodec = str(source.get("acodec") or "audio")
+    abr = int(round(float(source.get("abr") or 0))) or None
+    ext = str(source.get("ext") or "").lower()
+    if "opus" in acodec.lower() or ext in {"opus", "webm", "ogg"}:
+        original_ext = "opus"
+    elif "mp3" in acodec.lower() or ext == "mp3":
+        original_ext = "mp3"
+    else:
+        original_ext = "m4a"
+
+    out = [{
+        "id": f"audio-original-{source_id}",
+        "label": "Original audio",
+        "detail": f"{acodec.upper()}" + (f" · ~{abr} kbps" if abr else ""),
+        "audioOnly": True,
+        "sourceFormatId": source_id,
+        "output": "original",
+        "outputExt": original_ext,
+        "bitrate": abr,
+        "audioCodec": acodec,
+        "delivery": "server",
+    }]
+    for kbps in (128, 192, 256, 320):
+        out.append({
+            "id": f"audio-mp3-{kbps}-{source_id}",
+            "label": f"MP3 {kbps} kbps",
+            "detail": "MP3",
+            "audioOnly": True,
+            "sourceFormatId": source_id,
+            "output": "mp3",
+            "outputExt": "mp3",
+            "bitrate": kbps,
+            "audioCodec": "mp3",
+            "delivery": "server",
+        })
+    return out
 
 
 def youtube_like(url: str) -> bool:
@@ -760,12 +853,96 @@ async def run_native_transfer_prepare(job_id: str, session_id: str, choice_id: s
     )
 
 
+async def run_audio_prepare(job_id: str, session_id: str, choice_id: str, start: float | None, end: float | None) -> None:
+    rec = JOBS[job_id]
+    session = SESSIONS.get(session_id)
+    if not session:
+        rec.update(status="error", error="Media session expired before audio preparation started")
+        return
+    choice = session.get("audio_choices", {}).get(choice_id)
+    if not choice:
+        rec.update(status="error", error="Unknown audio choice")
+        return
+
+    directory = f"/tmp/anything-downloader-{job_id}"
+    os.makedirs(directory, exist_ok=True)
+    rec["directory"] = directory
+    rec["status"] = "preparing"
+    rec["strategy"] = "audio-extract"
+
+    try:
+        source_path = await ytdlp_download_format(
+            session["source_url"], str(choice.get("sourceFormatId") or ""), directory, "audio-source"
+        )
+    except Exception as e:
+        rec.update(status="error", error=f"yt-dlp audio transfer failed: {e}")
+        return
+
+    output_mode = str(choice.get("output") or "original")
+    out_ext = str(choice.get("outputExt") or "m4a").lower()
+    if out_ext not in {"m4a", "mp3", "opus", "ogg"}:
+        out_ext = "m4a"
+    output_path = Path(directory) / f"audio.{out_ext}"
+    cmd = [FFMPEG, "-hide_banner", "-loglevel", "error", "-nostdin", "-y"]
+    if start is not None:
+        cmd += ["-ss", f"{start:.3f}"]
+    cmd += ["-i", str(source_path)]
+    if start is not None and end is not None:
+        cmd += ["-t", f"{max(0.0, end - start):.3f}"]
+    cmd += ["-vn", "-map", "0:a:0?"]
+    if output_mode == "mp3":
+        kbps = int(choice.get("bitrate") or 192)
+        kbps = min(320, max(64, kbps))
+        cmd += ["-c:a", "libmp3lame", "-b:a", f"{kbps}k"]
+    elif out_ext == "opus":
+        # Preserve native Opus when possible; FFmpeg will fail clearly if the
+        # source codec/container cannot be stream-copied into .opus.
+        cmd += ["-c:a", "copy"]
+    else:
+        cmd += ["-c:a", "copy"]
+    cmd += [str(output_path)]
+
+    proc = await asyncio.create_subprocess_exec(
+        *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        env={**os.environ, "PYTHONUNBUFFERED": "1"},
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=MAX_PREPARE_SECONDS)
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.communicate()
+        rec.update(status="error", error="Audio preparation timed out")
+        return
+    if proc.returncode != 0:
+        detail = stderr.decode("utf-8", "replace").strip()[-2500:] or stdout.decode("utf-8", "replace").strip()[-1000:] or "FFmpeg audio preparation failed"
+        rec.update(status="error", error=f"Audio preparation failed: {detail}")
+        return
+    if not output_path.is_file() or output_path.stat().st_size <= 0:
+        rec.update(status="error", error="Audio preparation finished but no output file was produced")
+        return
+
+    base = safe_name(session.get("title") or "audio")
+    if start is not None and end is not None:
+        base += f"_{int(start)}-{int(end)}"
+    filename = f"{base}.{out_ext}"
+    rec.update(
+        status="ready", path=str(output_path), filename=filename, size=output_path.stat().st_size,
+        content_type=mimetypes.guess_type(filename)[0] or "audio/mpeg",
+        expires=time.time() + JOB_TTL,
+    )
+
+
 async def run_prepare(job_id: str, session_id: str, choice_id: str, start: float | None, end: float | None) -> None:
     rec = JOBS[job_id]
     session = SESSIONS.get(session_id)
     if not session:
         rec.update(status="error", error="Media session expired before preparation started")
         return
+    audio_choice = session.get("audio_choices", {}).get(choice_id)
+    if audio_choice:
+        await run_audio_prepare(job_id, session_id, choice_id, start, end)
+        return
+
     choice = session.get("choices", {}).get(choice_id)
     if not choice:
         rec.update(status="error", error="Unknown quality choice")
@@ -883,6 +1060,7 @@ async def analyze(req: AnalyzeRequest, authorization: str | None = Header(defaul
                 break
     raw_formats = normalize_sparse_formats(info, raw_formats)
     choices = make_choices(raw_formats)
+    audio_choices = make_audio_choices(raw_formats)
     if not choices:
         raise HTTPException(422, "The source was identified, but no non-DRM video formats were available")
 
@@ -981,6 +1159,7 @@ async def analyze(req: AnalyzeRequest, authorization: str | None = Header(defaul
         "formats": {k: v for k, v in streams.items() if str(v.get("protocol") or "").lower() in {"https", "http", "https_native", "http_native"}},
         "streams": streams,
         "choices": choice_map,
+        "audio_choices": {c["id"]: c for c in audio_choices},
         "source_url": source_url,
         "title": info.get("title") or "media",
         "duration": info.get("duration"),
@@ -1007,6 +1186,7 @@ async def analyze(req: AnalyzeRequest, authorization: str | None = Header(defaul
             for f in raw_formats
         ],
         "choices": choices,
+        "audioChoices": audio_choices,
         "previewFormatId": str(preview_format.get("format_id")) if preview_format else None,
         "previewSourceFormatId": str(preview_source.get("format_id")) if preview_source else None,
         "previewChoiceId": preview_choice.get("id") if preview_choice else None,
@@ -1250,9 +1430,10 @@ async def prepare(req: PrepareRequest, authorization: str | None = Header(defaul
     if not session:
         raise HTTPException(410, "Media session expired; analyze the URL again")
     choice = session.get("choices", {}).get(req.choiceId)
-    if not choice:
+    audio_choice = session.get("audio_choices", {}).get(req.choiceId)
+    if not choice and not audio_choice:
         raise HTTPException(404, "Unknown quality choice")
-    if choice.get("delivery") != "server":
+    if choice and choice.get("delivery") != "server":
         raise HTTPException(400, "This quality does not require server-side preparation")
 
     start = req.start
