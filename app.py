@@ -11,13 +11,14 @@ import time
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
+from http.cookies import SimpleCookie
 
 import httpx
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 
-APP_VERSION = "6.4.9"
+APP_VERSION = "6.4.10"
 SESSION_TTL = int(os.getenv("SESSION_TTL_SECONDS", "1800"))
 JOB_TTL = int(os.getenv("JOB_TTL_SECONDS", "1800"))
 API_KEY = os.getenv("ADAPTER_API_KEY", "").strip()
@@ -119,6 +120,59 @@ async def validate_public_https(raw: str) -> str:
 
 
 
+
+
+def cookie_header_for_url(cookie_dump: Any, media_url: str) -> str | None:
+    """Return only cookies whose Domain/Path match the resolved media URL.
+
+    yt-dlp may attach short-lived cookies to extracted formats. Replaying the
+    resolved URL without those cookies can produce 403 responses on some CDNs.
+    Do not forward unrelated cookies to third-party media hosts.
+    """
+    if not isinstance(cookie_dump, str) or not cookie_dump.strip():
+        return None
+    try:
+        parsed = urlparse(media_url)
+        host = (parsed.hostname or "").lower()
+        path = parsed.path or "/"
+        jar = SimpleCookie()
+        jar.load(cookie_dump)
+    except Exception:
+        return None
+
+    pairs: list[str] = []
+    for name, morsel in jar.items():
+        domain = str(morsel["domain"] or "").strip().lower().lstrip(".")
+        if domain and not (host == domain or host.endswith("." + domain)):
+            continue
+        cookie_path = str(morsel["path"] or "/").strip() or "/"
+        if not path.startswith(cookie_path):
+            continue
+        secure = bool(morsel["secure"])
+        if secure and parsed.scheme != "https":
+            continue
+        pairs.append(f"{name}={morsel.coded_value}")
+    return "; ".join(pairs) or None
+
+
+def merged_media_headers(info: dict[str, Any], f: dict[str, Any]) -> dict[str, str]:
+    """Merge page-level and format-level request context for resolved media."""
+    headers: dict[str, str] = {}
+    for source in (info.get("http_headers"), f.get("http_headers")):
+        if not isinstance(source, dict):
+            continue
+        for k, v in source.items():
+            if k and v is not None:
+                headers[str(k)] = str(v)
+
+    media_url = f.get("url")
+    if isinstance(media_url, str) and not any(k.lower() == "cookie" for k in headers):
+        cookie_dump = f.get("cookies") or info.get("cookies")
+        cookie_header = cookie_header_for_url(cookie_dump, media_url)
+        if cookie_header:
+            headers["Cookie"] = cookie_header
+    return headers
+
 def infer_ext_from_url(url: str) -> str | None:
     try:
         suffix = Path(urlparse(url).path).suffix.lower().lstrip(".")
@@ -155,6 +209,12 @@ def normalize_sparse_formats(info: dict[str, Any], formats: list[dict[str, Any]]
             f["height"] = info.get("height")
         if not f.get("width") and info.get("width"):
             f["width"] = info.get("width")
+
+        # yt-dlp often stores required media request context (for example a
+        # Referer) at the info-dict level rather than repeating it on every
+        # format. Resolve that inheritance now so relay/preview/FFmpeg requests
+        # faithfully replay the extractor's request context.
+        f["http_headers"] = merged_media_headers(info, f)
 
         fid = str(f.get("format_id") or "").strip()
         if not fid:
@@ -277,6 +337,14 @@ def make_choices(formats: list[dict[str, Any]]) -> list[dict[str, Any]]:
     video = [f for f in usable if is_video_format(f) and f.get("height")]
     unranked_video = [f for f in usable if is_video_format(f) and not f.get("height")]
     audio = [f for f in usable if is_audio_only_format(f)]
+    # Some sites expose their highest resolutions as video-only but also return
+    # a lower-resolution combined file containing a perfectly usable audio track.
+    # That combined file can safely act as an audio donor when no audio-only
+    # format exists; FFmpeg maps only its audio stream.
+    combined_audio_donors = [
+        f for f in usable
+        if is_video_format(f) and str(f.get("acodec") or "").lower() not in {"", "none"}
+    ]
     by_height: dict[int, list[dict[str, Any]]] = {}
     for f in video:
         by_height.setdefault(int(f["height"]), []).append(f)
@@ -295,8 +363,24 @@ def make_choices(formats: list[dict[str, Any]]) -> list[dict[str, Any]]:
         # Missing acodec on a progressive video is "unknown", not proof that
         # audio is absent. Twitch Clip MP4s are a common example. Only pair a
         # separate audio stream when the chosen format explicitly says acodec=none.
-        if str(chosen.get("acodec") or "").lower() == "none" and audio:
-            audio_f = max(audio, key=lambda f: audio_score(f, family))
+        if str(chosen.get("acodec") or "").lower() == "none":
+            if audio:
+                audio_f = max(audio, key=lambda f: audio_score(f, family))
+            elif combined_audio_donors:
+                def donor_score(f):
+                    ext = str(f.get("ext") or "").lower()
+                    acodec = str(f.get("acodec") or "").lower()
+                    family_match = (
+                        family == "mp4" and (ext in {"mp4", "m4a"} or "aac" in acodec or "mp4a" in acodec)
+                    ) or (
+                        family == "webm" and (ext == "webm" or "opus" in acodec or "vorbis" in acodec)
+                    )
+                    size = int(f.get("filesize") or f.get("filesize_approx") or 2**62)
+                    height = int(f.get("height") or 0)
+                    # Prefer compatible containers/codecs, then the smallest donor
+                    # because only its audio stream is needed.
+                    return (0 if family_match else 1, size, height)
+                audio_f = min(combined_audio_donors, key=donor_score)
 
         browser_delivery = is_progressive_http_format(chosen) and (audio_f is None or is_progressive_http_format(audio_f))
         delivery = "browser" if browser_delivery else "server"
