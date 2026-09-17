@@ -4,6 +4,7 @@ import ipaddress
 import json
 import mimetypes
 import os
+import re
 import secrets
 import shutil
 import socket
@@ -18,7 +19,7 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 
-APP_VERSION = "6.4.11"
+APP_VERSION = "6.4.12"
 SESSION_TTL = int(os.getenv("SESSION_TTL_SECONDS", "1800"))
 JOB_TTL = int(os.getenv("JOB_TTL_SECONDS", "1800"))
 API_KEY = os.getenv("ADAPTER_API_KEY", "").strip()
@@ -181,6 +182,39 @@ def infer_ext_from_url(url: str) -> str | None:
     return suffix if suffix in {"mp4", "webm", "mov", "m4v", "flv", "ts", "m3u8", "mp3", "m4a", "aac", "opus", "ogg"} else None
 
 
+def quality_dimension(f: dict[str, Any]) -> int | None:
+    """Return the conventional video quality dimension.
+
+    yt-dlp's `res` sort key is based on the smaller frame dimension. That is
+    what users expect from labels such as 360p/720p/1080p, and it also avoids
+    mislabeling portrait 1080x1920 video as 1920p.
+    """
+    def posint(v):
+        try:
+            n = int(float(v))
+            return n if n > 0 else None
+        except (TypeError, ValueError):
+            return None
+
+    w, h = posint(f.get("width")), posint(f.get("height"))
+    if w and h:
+        return min(w, h)
+
+    resolution = str(f.get("resolution") or "")
+    m = re.search(r"(\d{2,5})\s*[xX×]\s*(\d{2,5})", resolution)
+    if m:
+        return min(int(m.group(1)), int(m.group(2)))
+
+    # Prefer an explicit 720p/1080p-style note over a lone width/height field.
+    # Sparse extractors occasionally populate only one physical dimension.
+    note = " ".join(str(f.get(k) or "") for k in ("format_note", "format", "quality"))
+    m = re.search(r"(?<!\d)(\d{3,4})p(?!\d)", note, flags=re.I)
+    if m:
+        return int(m.group(1))
+
+    return h or w
+
+
 def normalize_sparse_formats(info: dict[str, Any], formats: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Fill only metadata needed by our delivery layer when an extractor is sparse.
 
@@ -205,10 +239,16 @@ def normalize_sparse_formats(info: dict[str, Any], formats: list[dict[str, Any]]
                 elif url.startswith("http://"):
                     f["protocol"] = "http"
 
-        if not f.get("height") and info.get("height"):
-            f["height"] = info.get("height")
-        if not f.get("width") and info.get("width"):
-            f["width"] = info.get("width")
+        # Only inherit page-level dimensions when this is genuinely one source
+        # format. With multiple renditions (Facebook is a common example), the
+        # top-level dimensions describe the overall media and are NOT evidence
+        # that every sparse SD/HD URL has that resolution. Copying them onto each
+        # format can label a 360p file as 1080p/1920p/4K.
+        if len(formats) == 1:
+            if not f.get("height") and info.get("height"):
+                f["height"] = info.get("height")
+            if not f.get("width") and info.get("width"):
+                f["width"] = info.get("width")
 
         # yt-dlp often stores required media request context (for example a
         # Referer) at the info-dict level rather than repeating it on every
@@ -259,7 +299,7 @@ def public_format(f: dict[str, Any]) -> dict[str, Any]:
     return {
         "id": str(f.get("format_id") or ""),
         "label": f.get("format_note") or f.get("resolution") or f.get("format") or str(f.get("format_id") or "format"),
-        "qualityLabel": f.get("resolution") if f.get("resolution") not in {None, "audio only"} else (f"{f.get('height')}p" if f.get("height") else None),
+        "qualityLabel": (f"{quality_dimension(f)}p" if quality_dimension(f) else (f.get("resolution") if f.get("resolution") not in {None, "audio only"} else None)),
         "ext": f.get("ext"),
         "protocol": f.get("protocol"),
         "width": f.get("width"),
@@ -334,8 +374,8 @@ def is_audio_only_format(f: dict[str, Any]) -> bool:
 
 def make_choices(formats: list[dict[str, Any]]) -> list[dict[str, Any]]:
     usable = [f for f in formats if has_usable_url(f)]
-    video = [f for f in usable if is_video_format(f) and f.get("height")]
-    unranked_video = [f for f in usable if is_video_format(f) and not f.get("height")]
+    video = [f for f in usable if is_video_format(f) and quality_dimension(f)]
+    unranked_video = [f for f in usable if is_video_format(f) and not quality_dimension(f)]
     audio = [f for f in usable if is_audio_only_format(f)]
     # Some sites expose their highest resolutions as video-only but also return
     # a lower-resolution combined file containing a perfectly usable audio track.
@@ -347,7 +387,9 @@ def make_choices(formats: list[dict[str, Any]]) -> list[dict[str, Any]]:
     ]
     by_height: dict[int, list[dict[str, Any]]] = {}
     for f in video:
-        by_height.setdefault(int(f["height"]), []).append(f)
+        q = quality_dimension(f)
+        if q:
+            by_height.setdefault(int(q), []).append(f)
 
     choices: list[dict[str, Any]] = []
     for height in sorted(by_height, reverse=True):
@@ -878,7 +920,7 @@ async def analyze(req: AnalyzeRequest, authorization: str | None = Header(defaul
         if not has_usable_url(f) or not is_progressive_http_format(f):
             continue
         try:
-            h = int(f.get("height") or 0)
+            h = int(quality_dimension(f) or 0)
         except Exception:
             h = 0
         ext = str(f.get("ext") or "").lower()
@@ -895,7 +937,7 @@ async def analyze(req: AnalyzeRequest, authorization: str | None = Header(defaul
         # out. Prefer known audio-bearing progressive files, then unknown-audio
         # direct files, and only then explicitly silent video-only files.
         def preview_score(f):
-            h = int(f.get("height") or 0)
+            h = int(quality_dimension(f) or 0)
             acodec = str(f.get("acodec") or "").lower()
             if acodec and acodec != "none":
                 audio_rank = 0
@@ -978,7 +1020,7 @@ async def analyze(req: AnalyzeRequest, authorization: str | None = Header(defaul
                 or str(preview_format.get("acodec") or "").lower() == "none"
             )
         ),
-        "previewHeight": int(preview_format.get("height") or 0) if preview_format else None,
+        "previewHeight": int(quality_dimension(preview_format) or 0) if preview_format else None,
         "previewExt": preview_format.get("ext") if preview_format else None,
         "browserChoiceCount": sum(1 for c in choices if c["delivery"] == "browser"),
         "serverChoiceCount": sum(1 for c in choices if c["delivery"] == "server"),
@@ -997,7 +1039,7 @@ def choose_preview_source(raw_formats: list[dict[str, Any]]) -> dict[str, Any] |
 
     def score(f: dict[str, Any]):
         try:
-            h = int(f.get("height") or 0)
+            h = int(quality_dimension(f) or 0)
         except Exception:
             h = 0
         if h:
