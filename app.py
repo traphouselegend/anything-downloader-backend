@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import ipaddress
 import json
 import mimetypes
@@ -16,7 +17,7 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 
-APP_VERSION = "6.4.7"
+APP_VERSION = "6.4.8"
 SESSION_TTL = int(os.getenv("SESSION_TTL_SECONDS", "1800"))
 JOB_TTL = int(os.getenv("JOB_TTL_SECONDS", "1800"))
 API_KEY = os.getenv("ADAPTER_API_KEY", "").strip()
@@ -24,12 +25,16 @@ YTDLP = os.getenv("YTDLP_BIN", "/opt/venv/bin/yt-dlp")
 POT_URL = os.getenv("POT_PROVIDER_URL", "http://127.0.0.1:4416").rstrip("/")
 MAX_ANALYZE_SECONDS = int(os.getenv("MAX_ANALYZE_SECONDS", "90"))
 MAX_PREPARE_SECONDS = int(os.getenv("MAX_PREPARE_SECONDS", "900"))
+MAX_PREVIEW_SECONDS = int(os.getenv("MAX_PREVIEW_SECONDS", "240"))
+PREVIEW_CACHE_ROOT = Path(os.getenv("PREVIEW_CACHE_ROOT", "/tmp/anything-downloader-preview"))
+PREVIEW_CACHE_ROOT.mkdir(parents=True, exist_ok=True)
 FFMPEG = os.getenv("FFMPEG_BIN", shutil.which("ffmpeg") or "ffmpeg")
 
 app = FastAPI(title="Anything Downloader Acquisition Adapter", version=APP_VERSION)
 SESSIONS: dict[str, dict[str, Any]] = {}
 JOBS: dict[str, dict[str, Any]] = {}
 ACTIVE_TASKS: set[asyncio.Task] = set()
+PREVIEW_LOCKS: dict[str, asyncio.Lock] = {}
 
 
 class AnalyzeRequest(BaseModel):
@@ -58,7 +63,12 @@ def cleanup() -> None:
     now = time.time()
     for key in list(SESSIONS):
         if SESSIONS[key]["expires"] < now:
-            SESSIONS.pop(key, None)
+            rec = SESSIONS.pop(key, None) or {}
+            preview_dir = rec.get("preview_dir")
+            if preview_dir:
+                shutil.rmtree(preview_dir, ignore_errors=True)
+            for lock_key in [k for k in PREVIEW_LOCKS if k.startswith(f"{key}:")]:
+                PREVIEW_LOCKS.pop(lock_key, None)
     for key in list(JOBS):
         rec = JOBS[key]
         if rec.get("expires", 0) < now:
@@ -644,6 +654,7 @@ async def analyze(req: AnalyzeRequest, authorization: str | None = Header(defaul
             audio_penalty = 0 if f.get("acodec") not in {None, "none"} else 1
             return (abs(h - 480), metadata_penalty, audio_penalty, h)
         preview_format = min(preview_candidates, key=preview_score)
+    preview_source = preview_format or choose_preview_source(raw_formats)
 
     choice_map = {c["id"]: c for c in choices}
     SESSIONS[sid] = {
@@ -654,6 +665,7 @@ async def analyze(req: AnalyzeRequest, authorization: str | None = Header(defaul
         "source_url": source_url,
         "title": info.get("title") or "media",
         "duration": info.get("duration"),
+        "preview_dir": None,
     }
 
     return {
@@ -672,11 +684,124 @@ async def analyze(req: AnalyzeRequest, authorization: str | None = Header(defaul
         "formats": [public_format(f) for f in raw_formats],
         "choices": choices,
         "previewFormatId": str(preview_format.get("format_id")) if preview_format else None,
+        "previewSourceFormatId": str(preview_source.get("format_id")) if preview_source else None,
         "previewHeight": int(preview_format.get("height") or 0) if preview_format else None,
         "previewExt": preview_format.get("ext") if preview_format else None,
         "browserChoiceCount": sum(1 for c in choices if c["delivery"] == "browser"),
         "serverChoiceCount": sum(1 for c in choices if c["delivery"] == "server"),
     }
+
+
+def choose_preview_source(raw_formats: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Pick a resolved video stream FFmpeg can normalize into a seekable preview."""
+    candidates: list[dict[str, Any]] = []
+    for f in raw_formats:
+        if not has_usable_url(f) or not is_video_format(f):
+            continue
+        candidates.append(f)
+    if not candidates:
+        return None
+
+    def score(f: dict[str, Any]):
+        try:
+            h = int(f.get("height") or 0)
+        except Exception:
+            h = 0
+        if h:
+            return (0, abs(h - 480), h)
+        return (1, 0, 0)
+
+    return min(candidates, key=score)
+
+
+async def ensure_seekable_preview(session_id: str, format_id: str) -> Path:
+    cleanup()
+    session = SESSIONS.get(session_id)
+    if not session:
+        raise HTTPException(410, "Media session expired; analyze the URL again")
+
+    duration = float(session.get("duration") or 0)
+    if duration <= 0:
+        raise HTTPException(409, "Preview duration is unavailable")
+    if duration > MAX_PREVIEW_SECONDS:
+        raise HTTPException(409, f"Prepared preview is limited to {MAX_PREVIEW_SECONDS} seconds")
+
+    item = session.get("streams", {}).get(format_id)
+    if not item or not item.get("url"):
+        raise HTTPException(404, "Preview source was not found")
+    await validate_public_https(item["url"])
+
+    cache_dir = PREVIEW_CACHE_ROOT / session_id
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    session["preview_dir"] = str(cache_dir)
+    digest = hashlib.sha256(format_id.encode("utf-8")).hexdigest()[:20]
+    output_path = cache_dir / f"{digest}.mp4"
+    if output_path.exists() and output_path.stat().st_size > 0:
+        return output_path
+
+    lock_key = f"{session_id}:{format_id}"
+    lock = PREVIEW_LOCKS.setdefault(lock_key, asyncio.Lock())
+    async with lock:
+        if output_path.exists() and output_path.stat().st_size > 0:
+            return output_path
+
+        tmp_path = output_path.with_suffix(".tmp.mp4")
+        tmp_path.unlink(missing_ok=True)
+        common = [FFMPEG, "-hide_banner", "-loglevel", "error", "-nostdin", "-y"]
+        input_args = ffmpeg_input_header_args(item.get("headers") or {})
+
+        async def run(cmd: list[str]):
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env={**os.environ, "PYTHONUNBUFFERED": "1"},
+            )
+            try:
+                stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=min(MAX_PREPARE_SECONDS, 180))
+            except asyncio.TimeoutError:
+                proc.kill()
+                await proc.communicate()
+                return 124, b"", b"Preview preparation timed out"
+            return proc.returncode, stdout, stderr
+
+        copy_cmd = [
+            *common, *input_args, "-i", item["url"],
+            "-map", "0:v:0", "-map", "0:a:0?",
+            "-c", "copy", "-movflags", "+faststart",
+            str(tmp_path),
+        ]
+        code, _, stderr = await run(copy_cmd)
+
+        if code != 0 or not tmp_path.exists() or tmp_path.stat().st_size <= 0:
+            tmp_path.unlink(missing_ok=True)
+            transcode_cmd = [
+                *common, *input_args, "-i", item["url"],
+                "-map", "0:v:0", "-map", "0:a:0?",
+                "-c:v", "libx264", "-preset", "veryfast", "-crf", "27",
+                "-c:a", "aac", "-b:a", "128k",
+                "-movflags", "+faststart", str(tmp_path),
+            ]
+            code, _, stderr = await run(transcode_cmd)
+
+        if code != 0 or not tmp_path.exists() or tmp_path.stat().st_size <= 0:
+            tmp_path.unlink(missing_ok=True)
+            detail = stderr.decode("utf-8", "replace")[-1200:] if stderr else "FFmpeg could not build the preview"
+            raise HTTPException(502, detail or "FFmpeg could not build the preview")
+
+        tmp_path.replace(output_path)
+        return output_path
+
+
+@app.get("/preview/{session}/{format_id}")
+async def preview(session: str, format_id: str, authorization: str | None = Header(default=None)):
+    require_auth(authorization)
+    path = await ensure_seekable_preview(session, format_id)
+    return FileResponse(
+        path,
+        media_type="video/mp4",
+        headers={"Cache-Control": "private, no-store", "Accept-Ranges": "bytes"},
+    )
 
 
 @app.get("/media/{session}/{format_id}")
