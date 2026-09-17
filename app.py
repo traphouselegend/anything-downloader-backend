@@ -19,7 +19,7 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 
-APP_VERSION = "6.5.0"
+APP_VERSION = "6.5.1"
 SESSION_TTL = int(os.getenv("SESSION_TTL_SECONDS", "1800"))
 JOB_TTL = int(os.getenv("JOB_TTL_SECONDS", "1800"))
 API_KEY = os.getenv("ADAPTER_API_KEY", "").strip()
@@ -524,11 +524,33 @@ def make_audio_choices(formats: list[dict[str, Any]]) -> list[dict[str, Any]]:
         f for f in usable
         if is_video_format(f) and str(f.get("acodec") or "").lower() not in {"", "none"}
     ]
-    pool = audio_only or combined
-    if not pool:
+    if not audio_only and not combined:
         return []
 
-    source = max(pool, key=lambda f: audio_score(f, "mp4"))
+    if audio_only:
+        # A true audio-only rendition is ideal: choose the best native audio.
+        source = max(audio_only, key=lambda f: audio_score(f, "mp4"))
+    else:
+        # Some extractors only expose audio inside combined A/V renditions.
+        # Audio is frequently identical across every video resolution; pulling
+        # the highest-resolution video just to discard it makes audio export
+        # needlessly slow. If explicit ABR exists, preserve the highest known
+        # audio bitrate, then choose the lightest rendition carrying it. If ABR
+        # is unknown, choose the smallest/lowest rendition with audio.
+        known_abr = [float(f.get("abr") or 0) for f in combined if float(f.get("abr") or 0) > 0]
+        candidates = combined
+        if known_abr:
+            best_abr = max(known_abr)
+            candidates = [f for f in combined if float(f.get("abr") or 0) >= best_abr * 0.98]
+
+        def lightest_audio_donor(f: dict[str, Any]):
+            size = int(f.get("filesize") or f.get("filesize_approx") or 2**62)
+            height = int(quality_dimension(f) or 10**9)
+            tbr = float(f.get("tbr") or 10**9)
+            return (size, height, tbr)
+
+        source = min(candidates, key=lightest_audio_donor)
+
     source_id = str(source.get("format_id") or "")
     if not source_id:
         return []
@@ -866,55 +888,107 @@ async def run_audio_prepare(job_id: str, session_id: str, choice_id: str, start:
 
     directory = f"/tmp/anything-downloader-{job_id}"
     os.makedirs(directory, exist_ok=True)
-    rec["directory"] = directory
-    rec["status"] = "preparing"
-    rec["strategy"] = "audio-extract"
+    rec.update(directory=directory, status="preparing", strategy="audio-extract", phase="Resolving audio source", progress=2)
 
-    try:
-        source_path = await ytdlp_download_format(
-            session["source_url"], str(choice.get("sourceFormatId") or ""), directory, "audio-source"
-        )
-    except Exception as e:
-        rec.update(status="error", error=f"yt-dlp audio transfer failed: {e}")
-        return
+    source_id = str(choice.get("sourceFormatId") or "")
+    stream = session.get("streams", {}).get(source_id)
+    native_transfer = bool(session.get("native_transfer"))
+    source_path: Path | None = None
+
+    # Only sites whose signed CDN URLs cannot be replayed (currently TikTok)
+    # should force a fresh yt-dlp media transfer. Everywhere else, consume the
+    # exact URL and headers captured during Analyze. This avoids transient
+    # format-ID failures and avoids downloading a whole video to disk before
+    # audio extraction can even begin.
+    if native_transfer or not stream or not stream.get("url"):
+        rec.update(phase="Fetching source with yt-dlp", progress=5)
+        try:
+            source_path = await ytdlp_download_format(
+                session["source_url"], source_id, directory, "audio-source"
+            )
+        except Exception as e:
+            rec.update(status="error", error=f"yt-dlp audio transfer failed: {e}")
+            return
+    else:
+        try:
+            await validate_public_https(stream["url"])
+        except Exception as e:
+            rec.update(status="error", error=f"Resolved audio source is no longer usable: {e}")
+            return
 
     output_mode = str(choice.get("output") or "original")
     out_ext = str(choice.get("outputExt") or "m4a").lower()
     if out_ext not in {"m4a", "mp3", "opus", "ogg"}:
         out_ext = "m4a"
     output_path = Path(directory) / f"audio.{out_ext}"
-    cmd = [FFMPEG, "-hide_banner", "-loglevel", "error", "-nostdin", "-y"]
+
+    cmd = [FFMPEG, "-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-progress", "pipe:1", "-nostats"]
     if start is not None:
         cmd += ["-ss", f"{start:.3f}"]
-    cmd += ["-i", str(source_path)]
+    if source_path is not None:
+        cmd += ["-i", str(source_path)]
+    else:
+        cmd += ffmpeg_input_header_args((stream or {}).get("headers") or {})
+        cmd += ["-i", str(stream["url"])]
     if start is not None and end is not None:
         cmd += ["-t", f"{max(0.0, end - start):.3f}"]
-    cmd += ["-vn", "-map", "0:a:0?"]
+    cmd += ["-vn", "-map", "0:a:0"]
     if output_mode == "mp3":
         kbps = int(choice.get("bitrate") or 192)
         kbps = min(320, max(64, kbps))
         cmd += ["-c:a", "libmp3lame", "-b:a", f"{kbps}k"]
-    elif out_ext == "opus":
-        # Preserve native Opus when possible; FFmpeg will fail clearly if the
-        # source codec/container cannot be stream-copied into .opus.
-        cmd += ["-c:a", "copy"]
+        phase = f"Encoding MP3 {kbps} kbps"
     else:
+        # Original means no lossy re-encode. AAC/mp4a stream-copies cleanly to
+        # M4A, Opus to .opus, and MP3 to .mp3.
         cmd += ["-c:a", "copy"]
+        phase = "Extracting original audio"
     cmd += [str(output_path)]
 
+    rec.update(phase=phase, progress=8)
     proc = await asyncio.create_subprocess_exec(
         *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
         env={**os.environ, "PYTHONUNBUFFERED": "1"},
     )
+
+    total_duration = None
+    if start is not None and end is not None:
+        total_duration = max(0.001, end - start)
+    elif session.get("duration"):
+        try:
+            total_duration = max(0.001, float(session["duration"]))
+        except Exception:
+            total_duration = None
+
+    stderr_task = asyncio.create_task(proc.stderr.read())
     try:
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=MAX_PREPARE_SECONDS)
+        async def watch_progress():
+            while True:
+                line = await proc.stdout.readline()
+                if not line:
+                    break
+                text = line.decode("utf-8", "replace").strip()
+                if text.startswith("out_time_ms=") and total_duration:
+                    try:
+                        # FFmpeg's out_time_ms value is expressed in microseconds.
+                        seconds = int(text.split("=", 1)[1]) / 1_000_000.0
+                        pct = max(0.0, min(1.0, seconds / total_duration))
+                        rec["progress"] = max(int(rec.get("progress") or 8), min(94, 8 + int(pct * 86)))
+                    except Exception:
+                        pass
+        await asyncio.wait_for(watch_progress(), timeout=MAX_PREPARE_SECONDS)
+        returncode = await asyncio.wait_for(proc.wait(), timeout=30)
+        stderr = await stderr_task
     except asyncio.TimeoutError:
         proc.kill()
-        await proc.communicate()
+        await proc.wait()
+        if not stderr_task.done():
+            stderr_task.cancel()
         rec.update(status="error", error="Audio preparation timed out")
         return
-    if proc.returncode != 0:
-        detail = stderr.decode("utf-8", "replace").strip()[-2500:] or stdout.decode("utf-8", "replace").strip()[-1000:] or "FFmpeg audio preparation failed"
+
+    if returncode != 0:
+        detail = stderr.decode("utf-8", "replace").strip()[-2500:] or "FFmpeg audio preparation failed"
         rec.update(status="error", error=f"Audio preparation failed: {detail}")
         return
     if not output_path.is_file() or output_path.stat().st_size <= 0:
@@ -926,7 +1000,8 @@ async def run_audio_prepare(job_id: str, session_id: str, choice_id: str, start:
         base += f"_{int(start)}-{int(end)}"
     filename = f"{base}.{out_ext}"
     rec.update(
-        status="ready", path=str(output_path), filename=filename, size=output_path.stat().st_size,
+        status="ready", phase="Ready", progress=100,
+        path=str(output_path), filename=filename, size=output_path.stat().st_size,
         content_type=mimetypes.guess_type(filename)[0] or "audio/mpeg",
         expires=time.time() + JOB_TTL,
     )
@@ -1471,6 +1546,10 @@ async def prepare_status(job_id: str, authorization: str | None = Header(default
     if not rec:
         raise HTTPException(404, "Preparation job not found or expired")
     out = {"ok": rec.get("status") != "error", "job": job_id, "status": rec.get("status")}
+    if rec.get("phase"):
+        out["phase"] = rec.get("phase")
+    if rec.get("progress") is not None:
+        out["progress"] = rec.get("progress")
     if rec.get("status") == "ready":
         out.update(filename=rec.get("filename"), size=rec.get("size"), contentType=rec.get("content_type"))
     if rec.get("error"):
