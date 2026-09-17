@@ -10,7 +10,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends python3 python3
 RUN python3 -m venv /opt/venv
 WORKDIR /app
 COPY requirements.txt ./
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt \
+ && pip install --no-cache-dir -U --pre "yt-dlp[default,curl-cffi]"
 COPY --from=bgutil-build /opt/bgutil /opt/bgutil
 COPY app.py start.sh ./
 RUN chmod +x /app/start.sh
