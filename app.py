@@ -17,7 +17,7 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 
-APP_VERSION = "6.4.8"
+APP_VERSION = "6.4.9"
 SESSION_TTL = int(os.getenv("SESSION_TTL_SECONDS", "1800"))
 JOB_TTL = int(os.getenv("JOB_TTL_SECONDS", "1800"))
 API_KEY = os.getenv("ADAPTER_API_KEY", "").strip()
@@ -646,17 +646,38 @@ async def analyze(req: AnalyzeRequest, authorization: str | None = Header(defaul
 
     preview_format = None
     if preview_candidates:
-        # 480p is a good preview target: quick to start but clear enough to seek.
-        # Prefer formats with explicit video/audio metadata when two candidates tie.
+        # Audio matters more than hitting exactly 480p. Some sites (notably
+        # Instagram Reels) expose a convenient 480p video-only rendition next
+        # to a slightly larger combined rendition. Picking by resolution first
+        # makes the browser preview look fine but leaves its audio control greyed
+        # out. Prefer known audio-bearing progressive files, then unknown-audio
+        # direct files, and only then explicitly silent video-only files.
         def preview_score(f):
             h = int(f.get("height") or 0)
+            acodec = str(f.get("acodec") or "").lower()
+            if acodec and acodec != "none":
+                audio_rank = 0
+            elif f.get("acodec") in {None, ""}:
+                audio_rank = 1  # unknown; many direct MP4 extractors omit codec metadata
+            else:
+                audio_rank = 2  # explicitly video-only
             metadata_penalty = 0 if f.get("vcodec") not in {None, "none"} else 1
-            audio_penalty = 0 if f.get("acodec") not in {None, "none"} else 1
-            return (abs(h - 480), metadata_penalty, audio_penalty, h)
+            return (audio_rank, abs(h - 480), metadata_penalty, h)
         preview_format = min(preview_candidates, key=preview_score)
     preview_source = preview_format or choose_preview_source(raw_formats)
 
     choice_map = {c["id"]: c for c in choices}
+
+    # If the best preview-quality video has a separate audio stream, the browser
+    # cannot play those two URLs as one <video>. Reuse the existing resolved
+    # choice and let /preview temporarily mux video+audio into a fast-start MP4.
+    audio_preview_choices = [c for c in choices if c.get("audioFormatId")]
+    preview_choice = None
+    if audio_preview_choices:
+        def preview_choice_score(c):
+            h = int(c.get("height") or 0)
+            return (abs(h - 480), h)
+        preview_choice = min(audio_preview_choices, key=preview_choice_score)
     SESSIONS[sid] = {
         "expires": time.time() + SESSION_TTL,
         "formats": {k: v for k, v in streams.items() if str(v.get("protocol") or "").lower() in {"https", "http", "https_native", "http_native"}},
@@ -685,6 +706,16 @@ async def analyze(req: AnalyzeRequest, authorization: str | None = Header(defaul
         "choices": choices,
         "previewFormatId": str(preview_format.get("format_id")) if preview_format else None,
         "previewSourceFormatId": str(preview_source.get("format_id")) if preview_source else None,
+        "previewChoiceId": preview_choice.get("id") if preview_choice else None,
+        # Force the muxed preview only when the direct preview is explicitly
+        # video-only (or absent). If the direct file already has audio, keep the
+        # faster browser-relay path and retain previewChoiceId only as fallback.
+        "previewUsePrepared": bool(
+            preview_choice and (
+                not preview_format
+                or str(preview_format.get("acodec") or "").lower() == "none"
+            )
+        ),
         "previewHeight": int(preview_format.get("height") or 0) if preview_format else None,
         "previewExt": preview_format.get("ext") if preview_format else None,
         "browserChoiceCount": sum(1 for c in choices if c["delivery"] == "browser"),
@@ -726,10 +757,25 @@ async def ensure_seekable_preview(session_id: str, format_id: str) -> Path:
     if duration > MAX_PREVIEW_SECONDS:
         raise HTTPException(409, f"Prepared preview is limited to {MAX_PREVIEW_SECONDS} seconds")
 
-    item = session.get("streams", {}).get(format_id)
+    streams = session.get("streams", {})
+    choice = session.get("choices", {}).get(format_id)
+    if choice:
+        video_id = str(choice.get("videoFormatId") or "")
+        audio_id = str(choice.get("audioFormatId") or "")
+        item = streams.get(video_id)
+        audio_item = streams.get(audio_id) if audio_id else None
+    else:
+        item = streams.get(format_id)
+        audio_item = None
+
     if not item or not item.get("url"):
         raise HTTPException(404, "Preview source was not found")
+    if choice and choice.get("audioFormatId") and (not audio_item or not audio_item.get("url")):
+        raise HTTPException(404, "Preview audio source was not found")
+
     await validate_public_https(item["url"])
+    if audio_item:
+        await validate_public_https(audio_item["url"])
 
     cache_dir = PREVIEW_CACHE_ROOT / session_id
     cache_dir.mkdir(parents=True, exist_ok=True)
@@ -748,7 +794,6 @@ async def ensure_seekable_preview(session_id: str, format_id: str) -> Path:
         tmp_path = output_path.with_suffix(".tmp.mp4")
         tmp_path.unlink(missing_ok=True)
         common = [FFMPEG, "-hide_banner", "-loglevel", "error", "-nostdin", "-y"]
-        input_args = ffmpeg_input_header_args(item.get("headers") or {})
 
         async def run(cmd: list[str]):
             proc = await asyncio.create_subprocess_exec(
@@ -765,19 +810,30 @@ async def ensure_seekable_preview(session_id: str, format_id: str) -> Path:
                 return 124, b"", b"Preview preparation timed out"
             return proc.returncode, stdout, stderr
 
-        copy_cmd = [
-            *common, *input_args, "-i", item["url"],
-            "-map", "0:v:0", "-map", "0:a:0?",
-            "-c", "copy", "-movflags", "+faststart",
-            str(tmp_path),
-        ]
+        copy_cmd = [*common]
+        copy_cmd += ffmpeg_input_header_args(item.get("headers") or {})
+        copy_cmd += ["-i", item["url"]]
+        if audio_item:
+            copy_cmd += ffmpeg_input_header_args(audio_item.get("headers") or {})
+            copy_cmd += ["-i", audio_item["url"]]
+            copy_cmd += ["-map", "0:v:0", "-map", "1:a:0", "-shortest"]
+        else:
+            copy_cmd += ["-map", "0:v:0", "-map", "0:a:0?"]
+        copy_cmd += ["-c", "copy", "-movflags", "+faststart", str(tmp_path)]
         code, _, stderr = await run(copy_cmd)
 
         if code != 0 or not tmp_path.exists() or tmp_path.stat().st_size <= 0:
             tmp_path.unlink(missing_ok=True)
-            transcode_cmd = [
-                *common, *input_args, "-i", item["url"],
-                "-map", "0:v:0", "-map", "0:a:0?",
+            transcode_cmd = [*common]
+            transcode_cmd += ffmpeg_input_header_args(item.get("headers") or {})
+            transcode_cmd += ["-i", item["url"]]
+            if audio_item:
+                transcode_cmd += ffmpeg_input_header_args(audio_item.get("headers") or {})
+                transcode_cmd += ["-i", audio_item["url"]]
+                transcode_cmd += ["-map", "0:v:0", "-map", "1:a:0", "-shortest"]
+            else:
+                transcode_cmd += ["-map", "0:v:0", "-map", "0:a:0?"]
+            transcode_cmd += [
                 "-c:v", "libx264", "-preset", "veryfast", "-crf", "27",
                 "-c:a", "aac", "-b:a", "128k",
                 "-movflags", "+faststart", str(tmp_path),
